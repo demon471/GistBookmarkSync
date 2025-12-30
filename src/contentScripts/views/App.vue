@@ -1,31 +1,370 @@
 <script setup lang="ts">
 import { useToggle } from '@vueuse/core'
+import { sendMessage } from 'webext-bridge/content-script'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import logoUrl from '~/assets/logo.png'
 import 'uno.css'
 
+type ShortcutPosition = {
+  side: 'left' | 'right'
+  y: number
+}
+
 const [show, toggle] = useToggle(false)
+const containerRef = ref<HTMLDivElement | null>(null)
+const isDragging = ref(false)
+const isHovering = ref(false)
+const pos = ref({ x: 0, y: 120, side: 'left' as ShortcutPosition['side'] })
+const dragStart = ref({ x: 0, y: 0, pointerX: 0, pointerY: 0 })
+
+const containerStyle = computed(() => ({
+  left: `${pos.value.x}px`,
+  top: `${pos.value.y}px`,
+}))
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max)
+}
+
+function getContainerSize() {
+  const rect = containerRef.value?.getBoundingClientRect()
+  return {
+    width: rect?.width || 44,
+    height: rect?.height || 44,
+  }
+}
+
+function getScrollbarMetrics() {
+  const doc = document.documentElement
+  const scrollbarWidth = Math.max(0, window.innerWidth - doc.clientWidth)
+  const direction = window.getComputedStyle(doc).direction
+  return {
+    width: scrollbarWidth,
+    onLeft: direction === 'rtl',
+  }
+}
+
+function snapToEdge(side?: ShortcutPosition['side']) {
+  const { width, height } = getContainerSize()
+  const viewportWidth = window.innerWidth
+  const viewportHeight = window.innerHeight
+  const scrollbar = getScrollbarMetrics()
+  const edgePadding = 8
+  const inferredSide = side || (pos.value.x + width / 2 < viewportWidth / 2 ? 'left' : 'right')
+  const leftInset = scrollbar.width > 0 && scrollbar.onLeft ? scrollbar.width : 0
+  const rightInset = scrollbar.width > 0 && !scrollbar.onLeft ? scrollbar.width : 0
+  const x = inferredSide === 'left'
+    ? leftInset + edgePadding
+    : viewportWidth - width - rightInset - edgePadding
+  const y = clamp(pos.value.y, 12, Math.max(12, viewportHeight - height - 12))
+  pos.value = { x, y, side: inferredSide }
+}
+
+async function loadPosition() {
+  try {
+    const stored = await browser.storage.local.get('shortcut-position') as { 'shortcut-position'?: ShortcutPosition }
+    const saved = stored['shortcut-position']
+    if (saved) {
+      pos.value.side = 'left'
+      pos.value.y = saved.y
+    }
+  }
+  catch {
+    // ignore storage failures
+  }
+
+  await nextTick()
+  snapToEdge(pos.value.side)
+}
+
+async function savePosition() {
+  const payload: ShortcutPosition = {
+    side: pos.value.side,
+    y: pos.value.y,
+  }
+  await browser.storage.local.set({ 'shortcut-position': payload })
+}
+
+function onPointerDown(event: PointerEvent) {
+  if (event.button !== 0)
+    return
+  isDragging.value = false
+  dragStart.value = {
+    x: pos.value.x,
+    y: pos.value.y,
+    pointerX: event.clientX,
+    pointerY: event.clientY,
+  }
+  const target = event.currentTarget as HTMLElement | null
+  target?.setPointerCapture(event.pointerId)
+}
+
+function onPointerMove(event: PointerEvent) {
+  if (dragStart.value.pointerX === 0 && dragStart.value.pointerY === 0)
+    return
+
+  const deltaX = event.clientX - dragStart.value.pointerX
+  const deltaY = event.clientY - dragStart.value.pointerY
+  if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3)
+    isDragging.value = true
+
+  if (!isDragging.value)
+    return
+
+  const { width, height } = getContainerSize()
+  const maxX = window.innerWidth - width
+  const maxY = window.innerHeight - height
+  pos.value.x = clamp(dragStart.value.x + deltaX, 0, maxX)
+  pos.value.y = clamp(dragStart.value.y + deltaY, 0, maxY)
+}
+
+async function onPointerUp(event: PointerEvent) {
+  const target = event.currentTarget as HTMLElement | null
+  target?.releasePointerCapture(event.pointerId)
+
+  if (!isDragging.value) {
+    toggle()
+  }
+  else {
+    snapToEdge()
+    await savePosition()
+  }
+
+  isDragging.value = false
+  dragStart.value = { x: 0, y: 0, pointerX: 0, pointerY: 0 }
+}
+
+async function uploadBookmarks() {
+  await sendMessage('sync-upload', undefined, 'background')
+}
+
+async function downloadBookmarks() {
+  await sendMessage('sync-download', undefined, 'background')
+}
+
+async function openSidePanel() {
+  await sendMessage('open-sidepanel', undefined, 'background')
+}
+
+function onResize() {
+  snapToEdge(pos.value.side)
+}
+
+onMounted(() => {
+  void loadPosition()
+  window.addEventListener('resize', onResize)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', onResize)
+})
 </script>
 
 <template>
-  <div class="fixed right-0 bottom-0 m-5 z-100 flex items-end font-sans select-none leading-1em">
+  <div
+    ref="containerRef"
+    class="shortcut"
+    :class="[{ 'is-dragging': isDragging, 'is-hover': isHovering, 'is-open': show }, `side-${pos.side}`]"
+    :style="containerStyle"
+    @mouseenter="isHovering = true"
+    @mouseleave="isHovering = false"
+  >
     <div
-      v-show="show"
-      class="bg-white text-gray-800 rounded-lg shadow w-max h-min"
-      p="x-4 y-2"
-      m="y-auto r-2"
-      transition="opacity duration-300"
-      :class="show ? 'opacity-100' : 'opacity-0'"
+      class="actions"
+      @pointerdown.stop
+      @pointerup.stop
     >
-      <h1 class="text-lg">
-        Vitesse WebExt
-      </h1>
-      <SharedSubtitle />
+      <button class="action-btn" title="上传书签" @click="uploadBookmarks">
+        <ph-cloud-arrow-up class="icon" />
+      </button>
+      <button class="action-btn" title="下载书签" @click="downloadBookmarks">
+        <ph-cloud-arrow-down class="icon" />
+      </button>
+      <button class="action-btn" title="打开侧边栏" @click="openSidePanel">
+        <ph-sidebar-simple class="icon" />
+      </button>
     </div>
     <button
-      class="flex w-10 h-10 rounded-full shadow cursor-pointer border-none"
-      bg="teal-600 hover:teal-700"
-      @click="toggle()"
+      class="shortcut-btn"
+      @pointerdown="onPointerDown"
+      @pointermove="onPointerMove"
+      @pointerup="onPointerUp"
+      @pointercancel="onPointerUp"
     >
-      <pixelarticons-power class="block m-auto text-white text-lg" />
+      <img class="icon-logo" :src="logoUrl" alt="Gist Sync">
     </button>
   </div>
 </template>
+
+<style scoped>
+.shortcut {
+  position: fixed;
+  z-index: 999999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  font-family: 'Space Grotesk', 'Noto Sans', 'Segoe UI', sans-serif;
+  user-select: none;
+  transition: opacity 200ms ease;
+}
+
+.shortcut.side-right {
+  align-items: flex-end;
+}
+
+.shortcut.side-left {
+  align-items: flex-start;
+}
+
+.shortcut.is-dragging {
+  transition: none;
+}
+
+.shortcut-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  border: none;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  box-shadow: 0 10px 20px rgba(9, 20, 18, 0.22);
+  cursor: pointer;
+  transition: transform 180ms ease, opacity 180ms ease, filter 180ms ease;
+  opacity: 0.45;
+  filter: grayscale(0.35);
+  touch-action: none;
+}
+
+.shortcut.is-hover .shortcut-btn,
+.shortcut.is-dragging .shortcut-btn {
+  opacity: 1;
+  filter: none;
+}
+
+.shortcut.is-hover.side-right .shortcut-btn,
+.shortcut.is-open.side-right .shortcut-btn {
+  transform: translateX(-6px);
+}
+
+.shortcut.is-hover.side-left .shortcut-btn,
+.shortcut.is-open.side-left .shortcut-btn {
+  transform: translateX(6px);
+}
+
+.icon {
+  font-size: 16px;
+  color: #b7bcbc;
+  pointer-events: none;
+}
+
+.icon-logo {
+  width: 16px;
+  height: 16px;
+  display: block;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  opacity: 0;
+  transform: translateY(8px) scale(0.98);
+  transition: opacity 200ms ease, transform 220ms ease;
+  pointer-events: none;
+}
+
+.shortcut.side-right .actions {
+  align-self: flex-end;
+  transform: translateX(6px) translateY(8px) scale(0.98);
+}
+
+.shortcut.side-left .actions {
+  align-self: flex-start;
+  transform: translateX(-6px) translateY(8px) scale(0.98);
+}
+
+.shortcut.is-open .actions,
+.shortcut.is-hover .actions,
+.shortcut.is-dragging .actions {
+  opacity: 1;
+  transform: translateY(-4px) scale(1);
+  pointer-events: auto;
+}
+
+.shortcut.is-open.side-right .actions,
+.shortcut.is-hover.side-right .actions,
+.shortcut.is-dragging.side-right .actions {
+  transform: translateX(-6px) translateY(-4px) scale(1);
+}
+
+.shortcut.is-open.side-left .actions,
+.shortcut.is-hover.side-left .actions,
+.shortcut.is-dragging.side-left .actions {
+  transform: translateX(6px) translateY(-4px) scale(1);
+}
+
+.action-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 10px;
+  border: none;
+  background: #eef9f6;
+  color: #1c1c1c;
+  display: grid;
+  place-items: center;
+  box-shadow: 0 10px 18px rgba(10, 22, 20, 0.12);
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(8px);
+  transition: transform 200ms ease, opacity 160ms ease, box-shadow 160ms ease;
+}
+
+.shortcut.is-open .action-btn,
+.shortcut.is-hover .action-btn,
+.shortcut.is-dragging .action-btn {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.shortcut.is-hover .action-btn:nth-child(1),
+.shortcut.is-open .action-btn:nth-child(1) {
+  transition-delay: 80ms;
+}
+
+.shortcut.is-hover .action-btn:nth-child(2),
+.shortcut.is-open .action-btn:nth-child(2) {
+  transition-delay: 40ms;
+}
+
+.shortcut.is-hover .action-btn:nth-child(3),
+.shortcut.is-open .action-btn:nth-child(3) {
+  transition-delay: 0ms;
+}
+
+.action-btn:hover {
+  transform: translateY(-1px);
+}
+
+@media (prefers-color-scheme: dark) {
+  .shortcut-btn {
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow: 0 12px 24px rgba(0, 0, 0, 0.5);
+  }
+
+  .action-btn {
+    background: #1a2623;
+    color: #d7efe9;
+    box-shadow: 0 10px 18px rgba(0, 0, 0, 0.5);
+  }
+
+  .icon {
+    color: #cfd6d5;
+  }
+}
+</style>

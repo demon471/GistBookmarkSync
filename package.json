@@ -1,5 +1,5 @@
 {
-  "name": "GistBookmarkSync",
+  "name": "gist-bookmark-sync",
   "displayName": "基于 Gist 的书签同步插件",
   "version": "0.0.1",
   "private": true,

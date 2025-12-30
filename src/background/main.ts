@@ -27,6 +27,322 @@ browser.runtime.onInstalled.addListener((): void => {
 
 let previousTabId = 0
 
+type SyncNode = {
+  title: string
+  url?: string
+  children?: SyncNode[]
+}
+
+type LocalFolderInfo = {
+  id: string
+  bookmarkUrls: Set<string>
+  folderTitles: Set<string>
+}
+
+type FolderNode = {
+  id: string
+  title: string
+  count: number
+  children: FolderNode[]
+}
+
+type GistLoadResult =
+  | { ok: true, gistNodes: SyncNode[], raw: { version?: number, bookmarks?: unknown[] } }
+  | { ok: false, error: string }
+
+function normalizeTitle(title?: string) {
+  return (title || '').trim()
+}
+
+function toSyncNodes(nodes?: browser.bookmarks.BookmarkTreeNode[]): SyncNode[] {
+  if (!nodes)
+    return []
+  return nodes.map((node) => {
+    if (node.url)
+      return { title: node.title || node.url, url: node.url }
+
+    const children = toSyncNodes(node.children)
+    return { title: node.title || 'Untitled', children }
+  })
+}
+
+function filterLocalNodes(nodes: browser.bookmarks.BookmarkTreeNode[], selectedIds: Set<string>): SyncNode[] {
+  const result: SyncNode[] = []
+
+  for (const node of nodes) {
+    if (node.url) {
+      result.push({ title: node.title || node.url, url: node.url })
+      continue
+    }
+
+    if (!selectedIds.has(node.id))
+      continue
+
+    const children = filterLocalNodes(node.children || [], selectedIds)
+    result.push({
+      title: node.title || 'Untitled',
+      children,
+    })
+  }
+
+  return result
+}
+
+function sanitizeNodes(input: unknown): SyncNode[] {
+  if (!Array.isArray(input))
+    return []
+
+  const nodes: SyncNode[] = []
+  for (const item of input) {
+    if (!item || typeof item !== 'object')
+      continue
+
+    const record = item as { title?: unknown, url?: unknown, children?: unknown }
+    const title = typeof record.title === 'string'
+      ? record.title
+      : (typeof record.url === 'string' ? record.url : 'Untitled')
+
+    if (typeof record.url === 'string') {
+      nodes.push({ title, url: record.url })
+      continue
+    }
+
+    nodes.push({ title, children: sanitizeNodes(record.children) })
+  }
+
+  return nodes
+}
+
+function buildFolderTree(node: browser.bookmarks.BookmarkTreeNode): { folder?: FolderNode, count: number } {
+  if (node.url)
+    return { count: 1 }
+
+  const children: FolderNode[] = []
+  let count = 0
+  for (const child of node.children || []) {
+    const childResult = buildFolderTree(child)
+    count += childResult.count
+    if (childResult.folder)
+      children.push(childResult.folder)
+  }
+
+  return {
+    count,
+    folder: {
+      id: node.id,
+      title: node.title || 'Untitled',
+      count,
+      children,
+    },
+  }
+}
+
+async function loadGistBookmarks(token: string, gistId: string, fileName: string): Promise<GistLoadResult> {
+  const response = await fetch(`https://api.github.com/gists/${gistId}`, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `token ${token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  })
+
+  if (response.status === 401)
+    return { ok: false, error: 'GitHub Token is invalid or expired' }
+  if (response.status === 403)
+    return { ok: false, error: 'GitHub API access denied or rate limited' }
+  if (response.status === 404)
+    return { ok: false, error: 'Gist not found or no access' }
+  if (!response.ok)
+    return { ok: false, error: 'Sync failed, please try again' }
+
+  const gist = await response.json() as {
+    files?: Record<string, { content?: string, truncated?: boolean, raw_url?: string }>
+  }
+  const file = gist.files?.[fileName]
+  if (!file)
+    return { ok: false, error: 'Gist file name not found' }
+
+  let content = file.content ?? ''
+  if (file.truncated && file.raw_url) {
+    const rawResponse = await fetch(file.raw_url, {
+      headers: {
+        Authorization: `token ${token}`,
+      },
+    })
+    if (!rawResponse.ok)
+      return { ok: false, error: 'Failed to fetch full Gist content' }
+    content = await rawResponse.text()
+  }
+
+  let parsed: { version?: number, bookmarks?: unknown[] }
+  try {
+    parsed = JSON.parse(content) as { version?: number, bookmarks?: unknown[] }
+  }
+  catch {
+    return { ok: false, error: 'Gist file is not valid JSON' }
+  }
+
+  const gistNodes = sanitizeNodes(parsed.bookmarks)
+  return { ok: true, gistNodes, raw: parsed }
+}
+
+async function loadLocalNodes(selectedFolderIds?: string[]) {
+  const localTree = await browser.bookmarks.getTree()
+  const root = localTree[0]
+  if (!root)
+    return { ok: false, error: 'Failed to read local bookmarks' }
+
+  const selectedSet = new Set(selectedFolderIds || [])
+  const localNodes = selectedSet.size > 0
+    ? filterLocalNodes(root.children || [], selectedSet)
+    : toSyncNodes(root.children)
+
+  return { ok: true, root, localNodes }
+}
+
+async function updateGistFile(token: string, gistId: string, fileName: string, nodes: SyncNode[]) {
+  const updateResponse = await fetch(`https://api.github.com/gists/${gistId}`, {
+    method: 'PATCH',
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `token ${token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    body: JSON.stringify({
+      files: {
+        [fileName]: {
+          content: `${JSON.stringify({ version: 1, bookmarks: nodes }, null, 2)}\n`,
+        },
+      },
+    }),
+  })
+
+  return updateResponse.ok
+}
+
+function mergeNodeLists(localNodes: SyncNode[], gistNodes: SyncNode[]) {
+  const result: SyncNode[] = []
+  const index = new Map<string, SyncNode>()
+
+  for (const node of localNodes) {
+    const key = node.url ? `url:${node.url}` : `folder:${normalizeTitle(node.title)}`
+    index.set(key, node)
+    result.push(node)
+  }
+
+  for (const node of gistNodes) {
+    const key = node.url ? `url:${node.url}` : `folder:${normalizeTitle(node.title)}`
+    const existing = index.get(key)
+    if (!existing) {
+      result.push(node)
+      continue
+    }
+
+    if (!node.url && !existing.url) {
+      existing.children = mergeNodeLists(existing.children || [], node.children || [])
+    }
+  }
+
+  return result
+}
+
+function countBookmarks(nodes: SyncNode[]): number {
+  let count = 0
+  for (const node of nodes) {
+    if (node.url)
+      count += 1
+    if (node.children)
+      count += countBookmarks(node.children)
+  }
+  return count
+}
+
+async function buildLocalIndex(root: browser.bookmarks.BookmarkTreeNode) {
+  const index = new Map<string, LocalFolderInfo>()
+  const rootPath = ''
+
+  function ensureFolder(path: string, id: string) {
+    if (!index.has(path)) {
+      index.set(path, {
+        id,
+        bookmarkUrls: new Set(),
+        folderTitles: new Set(),
+      })
+    }
+  }
+
+  function walk(node: browser.bookmarks.BookmarkTreeNode, currentPath: string) {
+    if (node.url) {
+      const folder = index.get(currentPath)
+      folder?.bookmarkUrls.add(node.url)
+      return
+    }
+
+    const title = normalizeTitle(node.title)
+    const path = currentPath ? `${currentPath}/${title}` : title
+    ensureFolder(path, node.id)
+
+    const parentFolder = index.get(currentPath)
+    if (parentFolder && title)
+      parentFolder.folderTitles.add(title)
+
+    for (const child of node.children || [])
+      walk(child, path)
+  }
+
+  ensureFolder(rootPath, root.id)
+  for (const child of root.children || [])
+    walk(child, rootPath)
+
+  return index
+}
+
+async function ensureLocalEntries(rootId: string, index: Map<string, LocalFolderInfo>, nodes: SyncNode[]) {
+  async function ensureFolder(path: string, title: string, parentId: string) {
+    const normalizedTitle = normalizeTitle(title)
+    const nextPath = path ? `${path}/${normalizedTitle}` : normalizedTitle
+    const existing = index.get(nextPath)
+    if (existing)
+      return { path: nextPath, info: existing }
+
+    const created = await browser.bookmarks.create({ parentId, title: normalizedTitle || 'Untitled' })
+    const info = {
+      id: created.id,
+      bookmarkUrls: new Set<string>(),
+      folderTitles: new Set<string>(),
+    }
+    index.set(nextPath, info)
+    const parent = index.get(path)
+    if (parent)
+      parent.folderTitles.add(normalizedTitle)
+    return { path: nextPath, info }
+  }
+
+  async function walk(list: SyncNode[], currentPath: string, parentId: string) {
+    const folderInfo = index.get(currentPath)
+    const existingUrls = folderInfo?.bookmarkUrls || new Set<string>()
+
+    for (const node of list) {
+      if (node.url) {
+        if (!existingUrls.has(node.url)) {
+          await browser.bookmarks.create({
+            parentId,
+            title: node.title || node.url,
+            url: node.url,
+          })
+          existingUrls.add(node.url)
+        }
+        continue
+      }
+
+      const ensured = await ensureFolder(currentPath, node.title, parentId)
+      await walk(node.children || [], ensured.path, ensured.info.id)
+    }
+  }
+
+  await walk(nodes, '', rootId)
+}
+
 // communication example: send previous tab title from background page
 // see shim.d.ts for type declaration
 browser.tabs.onActivated.addListener(async ({ tabId }) => {
@@ -69,17 +385,61 @@ onMessage('validate-gist-auth', async ({ data }) => {
   const gistId = data?.gistId?.trim()
   const fileName = data?.fileName?.trim()
   const autoCreate = data?.autoCreate ?? false
+  const createIfMissing = data?.createIfMissing ?? false
   const errors: string[] = []
 
   if (!token)
     errors.push('GitHub Token is required')
-  if (!gistId)
+  if (!gistId && !createIfMissing)
     errors.push('Gist ID is required')
   if (!fileName)
     errors.push('Gist file name is required')
 
   if (errors.length > 0)
     return { ok: false, errors }
+
+  async function createNewGist() {
+    const createResponse = await fetch('https://api.github.com/gists', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `token ${token}`,
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+      body: JSON.stringify({
+        description: 'GistBookmarkSync',
+        public: false,
+        files: {
+          [fileName]: {
+            content: '{\"version\":1,\"bookmarks\":[]}\n',
+          },
+        },
+      }),
+    })
+
+    if (!createResponse.ok)
+      return { ok: false, errors: ['Failed to create new Gist'] }
+
+    const created = await createResponse.json() as { id?: string, files?: Record<string, unknown>, description?: string, owner?: { login?: string } }
+    const createdFiles = Object.keys(created.files || {})
+
+    if (!created.id)
+      return { ok: false, errors: ['Gist created but missing ID'] }
+
+    return {
+      ok: true,
+      createdGist: true,
+      gist: {
+        id: created.id,
+        owner: created.owner?.login,
+        description: created.description,
+        files: createdFiles,
+      },
+    }
+  }
+
+  if (!gistId && createIfMissing)
+    return await createNewGist()
 
   const response = await fetch(`https://api.github.com/gists/${gistId}`, {
     headers: {
@@ -93,8 +453,11 @@ onMessage('validate-gist-auth', async ({ data }) => {
     return { ok: false, errors: ['GitHub Token is invalid or expired'] }
   if (response.status === 403)
     return { ok: false, errors: ['GitHub API access denied or rate limited'] }
-  if (response.status === 404)
+  if (response.status === 404) {
+    if (createIfMissing)
+      return await createNewGist()
     return { ok: false, errors: ['Gist not found or no access'] }
+  }
   if (!response.ok)
     return { ok: false, errors: ['Validation failed, please try again'] }
 
@@ -129,7 +492,8 @@ onMessage('validate-gist-auth', async ({ data }) => {
 
     return {
       ok: true,
-      created: true,
+      createdFile: true,
+      createdGist: false,
       gist: {
         id: gistId,
         owner: createdGist.owner?.login,
@@ -141,12 +505,128 @@ onMessage('validate-gist-auth', async ({ data }) => {
 
   return {
     ok: true,
-    created: false,
+    createdFile: false,
+    createdGist: false,
     gist: {
       id: gistId,
       owner: gist.owner?.login,
       description: gist.description,
       files: fileNames,
     },
+  }
+})
+
+onMessage('get-bookmark-folders', async () => {
+  const tree = await browser.bookmarks.getTree()
+  const root = tree[0]
+  if (!root)
+    return { ok: false, error: 'Failed to load bookmarks' }
+
+  const folders: FolderNode[] = []
+  for (const child of root.children || []) {
+    const built = buildFolderTree(child)
+    if (built.folder)
+      folders.push(built.folder)
+  }
+
+  return {
+    ok: true,
+    tree: folders,
+  }
+})
+
+async function performSync(mode: 'upload' | 'download') {
+  const stored = await browser.storage.local.get([
+    'github-token',
+    'gist-id',
+    'gist-file-name',
+    'sync-direction',
+    'sync-conflict-strategy',
+    'sync-folder-selection',
+  ])
+  const token = (stored['github-token'] as string | undefined)?.trim()
+  const gistId = (stored['gist-id'] as string | undefined)?.trim()
+  const fileName = (stored['gist-file-name'] as string | undefined)?.trim()
+  const syncDirection = (stored['sync-direction'] as string | undefined) || 'pull'
+  const conflictStrategy = (stored['sync-conflict-strategy'] as string | undefined) || 'gist-wins'
+  const selectedFolderIds = stored['sync-folder-selection'] as string[] | undefined
+
+  if (!token || !gistId || !fileName) {
+    return {
+      ok: false,
+      error: 'Missing GitHub Token, Gist ID, or Gist file name',
+    }
+  }
+
+  const gistResult = await loadGistBookmarks(token, gistId, fileName)
+  if (!gistResult.ok)
+    return { ok: false, error: gistResult.error }
+
+  const localResult = await loadLocalNodes(selectedFolderIds)
+  if (!localResult.ok)
+    return { ok: false, error: localResult.error }
+
+  const mergedNodes = mergeNodeLists(localResult.localNodes, gistResult.gistNodes)
+
+  if (mode === 'upload') {
+    const updated = await updateGistFile(token, gistId, fileName, mergedNodes)
+    if (!updated)
+      return { ok: false, error: 'Failed to update Gist with merged data' }
+  }
+
+  const index = await buildLocalIndex(localResult.root)
+  await ensureLocalEntries(localResult.root.id, index, mergedNodes)
+
+  const gistCount = countBookmarks(gistResult.gistNodes)
+  const localCount = countBookmarks(localResult.localNodes)
+  const mergedCount = countBookmarks(mergedNodes)
+  const actionLabel = mode === 'upload' ? 'Uploaded' : 'Downloaded'
+  const summary = `${actionLabel} ${mergedCount} items (gist ${gistCount}, local ${localCount})`
+  const timestamp = new Date().toISOString()
+
+  await browser.storage.local.set({
+    'gist-bookmarks-cache': { version: 1, bookmarks: mergedNodes },
+    'gist-last-sync': timestamp,
+    'gist-last-sync-summary': summary,
+    'gist-last-sync-direction': syncDirection,
+    'gist-last-sync-strategy': conflictStrategy,
+    'gist-last-sync-folders': selectedFolderIds || [],
+  })
+
+  return {
+    ok: true,
+    summary,
+    timestamp,
+  }
+}
+
+onMessage('sync-upload', async () => {
+  return await performSync('upload')
+})
+
+onMessage('sync-download', async () => {
+  return await performSync('download')
+})
+
+onMessage('sync-now', async () => {
+  return await performSync('upload')
+})
+
+onMessage('open-sidepanel', async () => {
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true })
+    if (!tab?.id)
+      return { ok: false, error: 'No active tab found' }
+
+    // @ts-expect-error sidePanel is not typed in polyfill
+    if (!browser.sidePanel?.open)
+      return { ok: false, error: 'Side panel not supported' }
+
+    // @ts-expect-error sidePanel is not typed in polyfill
+    await browser.sidePanel.open({ tabId: tab.id })
+    return { ok: true }
+  }
+  catch {
+    return { ok: false, error: 'Failed to open side panel' }
   }
 })
