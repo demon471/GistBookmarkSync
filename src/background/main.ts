@@ -26,6 +26,7 @@ browser.runtime.onInstalled.addListener((): void => {
 })
 
 let previousTabId = 0
+const sidePanelOpenByTab = new Map<number, boolean>()
 
 type SyncNode = {
   title: string
@@ -612,18 +613,37 @@ onMessage('sync-now', async () => {
   return await performSync('upload')
 })
 
-onMessage('open-sidepanel', async () => {
+onMessage('open-sidepanel', ({ sender }) => {
   try {
-    const [tab] = await browser.tabs.query({ active: true, currentWindow: true })
-    if (!tab?.id)
-      return { ok: false, error: 'No active tab found' }
+    const tabId = sender?.tabId ?? sender?.tab?.id
+    if (!tabId)
+      return { ok: false, error: 'No tab id from sender' }
 
     // @ts-expect-error sidePanel is not typed in polyfill
     if (!browser.sidePanel?.open)
       return { ok: false, error: 'Side panel not supported' }
 
+    const isOpen = sidePanelOpenByTab.get(tabId) ?? false
+    if (isOpen) {
+      // @ts-expect-error sidePanel is not typed in polyfill
+      if (browser.sidePanel?.close) {
+        // @ts-expect-error sidePanel is not typed in polyfill
+        void browser.sidePanel.close({ tabId })
+      }
+      else {
+        // @ts-expect-error sidePanel is not typed in polyfill
+        void browser.sidePanel.setOptions?.({ tabId, enabled: false })
+      }
+      sidePanelOpenByTab.set(tabId, false)
+      return { ok: true }
+    }
+
+    // Fire immediately to preserve the user-gesture chain.
     // @ts-expect-error sidePanel is not typed in polyfill
-    await browser.sidePanel.open({ tabId: tab.id })
+    void browser.sidePanel.setOptions?.({ tabId, path: 'dist/sidepanel/index.html', enabled: true })
+    // @ts-expect-error sidePanel is not typed in polyfill
+    void browser.sidePanel.open({ tabId })
+    sidePanelOpenByTab.set(tabId, true)
     return { ok: true }
   }
   catch {
