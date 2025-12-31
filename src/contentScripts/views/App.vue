@@ -11,9 +11,15 @@ type ShortcutPosition = {
 
 const containerRef = ref<HTMLDivElement | null>(null);
 const isDragging = ref(false);
-const isHovering = ref(false);
+const isHoveringShortcut = ref(false);
+const isHoveringActions = ref(false);
+const isHovering = computed(
+  () => isHoveringShortcut.value || isHoveringActions.value,
+);
+const isReady = ref(false);
 const pos = ref({ x: 0, y: 120, side: "right" as ShortcutPosition["side"] });
 const dragStart = ref({ x: 0, y: 0, pointerX: 0, pointerY: 0 });
+const hoverActivationWidth = 52;
 
 const containerStyle = computed(() => ({
   left: `${pos.value.x}px`,
@@ -62,6 +68,16 @@ function snapToEdge(side?: ShortcutPosition["side"]) {
   pos.value = { x, y, side: inferredSide };
 }
 
+function updateHoverByPointer(event: MouseEvent) {
+  if (!containerRef.value) return;
+  const rect = containerRef.value.getBoundingClientRect();
+  const distance =
+    pos.value.side === "right"
+      ? rect.right - event.clientX
+      : event.clientX - rect.left;
+  isHoveringShortcut.value = distance <= hoverActivationWidth;
+}
+
 async function loadPosition() {
   try {
     const stored = (await browser.storage.local.get("shortcut-position")) as {
@@ -81,11 +97,15 @@ async function loadPosition() {
 }
 
 async function savePosition() {
-  const payload: ShortcutPosition = {
-    side: pos.value.side,
-    y: pos.value.y,
-  };
-  await browser.storage.local.set({ "shortcut-position": payload });
+  try {
+    const payload: ShortcutPosition = {
+      side: pos.value.side,
+      y: pos.value.y,
+    };
+    await browser.storage.local.set({ "shortcut-position": payload });
+  } catch {
+    // ignore storage failures
+  }
 }
 
 function onPointerDown(event: PointerEvent) {
@@ -121,13 +141,16 @@ async function onPointerUp(event: PointerEvent) {
   const target = event.currentTarget as HTMLElement | null;
   target?.releasePointerCapture(event.pointerId);
 
-  if (isDragging.value) {
-    snapToEdge();
-    await savePosition();
-  }
-
+  const wasDragging = isDragging.value;
   isDragging.value = false;
   dragStart.value = { x: 0, y: 0, pointerX: 0, pointerY: 0 };
+
+  if (wasDragging) {
+    const nextSide =
+      event.clientX < window.innerWidth / 2 ? "left" : "right";
+    snapToEdge(nextSide);
+    await savePosition();
+  }
 }
 
 async function uploadBookmarks() {
@@ -147,7 +170,10 @@ function onResize() {
 }
 
 onMounted(() => {
-  void loadPosition();
+  void (async () => {
+    await loadPosition();
+    isReady.value = true;
+  })();
   window.addEventListener("resize", onResize);
 });
 
@@ -161,14 +187,21 @@ onBeforeUnmount(() => {
     ref="containerRef"
     class="shortcut"
     :class="[
-      { 'is-dragging': isDragging, 'is-hover': isHovering },
+      { 'is-dragging': isDragging, 'is-hover': isHovering, 'is-loading': !isReady },
       `side-${pos.side}`,
     ]"
     :style="containerStyle"
-    @mouseenter="isHovering = true"
-    @mouseleave="isHovering = false"
+    @mouseenter="updateHoverByPointer"
+    @mousemove="updateHoverByPointer"
+    @mouseleave="isHoveringShortcut = false"
   >
-    <div class="actions" @pointerdown.stop @pointerup.stop>
+    <div
+      class="actions"
+      @pointerdown.stop
+      @pointerup.stop
+      @mouseenter="isHoveringActions = true"
+      @mouseleave="isHoveringActions = false"
+    >
       <div class="action-item">
         <button class="action-btn" @click="uploadBookmarks">
           <ph-cloud-arrow-up class="icon" />
@@ -211,6 +244,12 @@ onBeforeUnmount(() => {
   font-family: "Space Grotesk", "Noto Sans", "Segoe UI", sans-serif;
   user-select: none;
   transition: opacity 200ms ease;
+}
+
+.shortcut.is-loading {
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
 }
 
 .shortcut.side-right {
@@ -276,8 +315,9 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 8px;
   opacity: 0;
+  visibility: hidden;
   transform: translateY(8px) scale(0.98);
-  transition: opacity 140ms ease, transform 180ms ease;
+  transition: opacity 140ms ease, transform 180ms ease, visibility 0ms 140ms;
   pointer-events: none;
 }
 
@@ -306,7 +346,7 @@ onBeforeUnmount(() => {
   color: #fff;
   padding: 2px 6px;
   border-radius: 8px;
-  background: rgba(10, 18, 17, 0.08);
+  background: #1c1c1c;
   white-space: nowrap;
   pointer-events: none;
   opacity: 0;
@@ -322,8 +362,10 @@ onBeforeUnmount(() => {
 .shortcut.is-hover .actions,
 .shortcut.is-dragging .actions {
   opacity: 1;
+  visibility: visible;
   transform: translateY(-4px) scale(1);
   pointer-events: auto;
+  transition: opacity 140ms ease, transform 180ms ease, visibility 0ms;
 }
 
 .shortcut.is-hover.side-right .actions,
@@ -392,7 +434,7 @@ onBeforeUnmount(() => {
 
   .action-label {
     color: #d6dfdd;
-    background: rgba(230, 240, 238, 0.08);
+    background: #1c1c1c;
   }
 }
 </style>

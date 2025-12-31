@@ -68,7 +68,7 @@ async function syncNow() {
   syncMessage.value = ''
 
   try {
-    const result = await sendMessage('sync-now', undefined, 'background')
+    const result = await sendMessage('sync-upload', undefined, 'background')
     if (result.ok) {
       syncState.value = 'done'
       syncMessage.value = result.summary || 'Sync finished'

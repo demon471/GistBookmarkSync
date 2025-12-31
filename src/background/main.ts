@@ -48,7 +48,7 @@ type FolderNode = {
 }
 
 type GistLoadResult =
-  | { ok: true, gistNodes: SyncNode[], raw: { version?: number, bookmarks?: unknown[] } }
+  | { ok: true, gistNodes: SyncNode[], raw: { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] } }
   | { ok: false, error: string }
 
 function normalizeTitle(title?: string) {
@@ -175,13 +175,16 @@ async function loadGistBookmarks(token: string, gistId: string, fileName: string
     content = await rawResponse.text()
   }
 
-  let parsed: { version?: number, bookmarks?: unknown[] }
+  let parsed: { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
   try {
-    parsed = JSON.parse(content) as { version?: number, bookmarks?: unknown[] }
+    parsed = JSON.parse(content) as { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
   }
   catch {
     return { ok: false, error: 'Gist file is not valid JSON' }
   }
+
+  if (!Array.isArray(parsed.bookmarks))
+    return { ok: false, error: 'Gist file missing bookmarks array' }
 
   const gistNodes = sanitizeNodes(parsed.bookmarks)
   return { ok: true, gistNodes, raw: parsed }
@@ -194,14 +197,27 @@ async function loadLocalNodes(selectedFolderIds?: string[]) {
     return { ok: false, error: 'Failed to read local bookmarks' }
 
   const selectedSet = new Set(selectedFolderIds || [])
-  const localNodes = selectedSet.size > 0
+  let localNodes = selectedSet.size > 0
     ? filterLocalNodes(root.children || [], selectedSet)
     : toSyncNodes(root.children)
+
+  if (selectedSet.size > 0 && localNodes.length === 0)
+    localNodes = toSyncNodes(root.children)
 
   return { ok: true, root, localNodes }
 }
 
+function buildBookmarkPayload(nodes: SyncNode[]) {
+  return {
+    browser: navigator.userAgent,
+    version: browser.runtime.getManifest().version,
+    createDate: Date.now(),
+    bookmarks: nodes,
+  }
+}
+
 async function updateGistFile(token: string, gistId: string, fileName: string, nodes: SyncNode[]) {
+  const payload = buildBookmarkPayload(nodes)
   const updateResponse = await fetch(`https://api.github.com/gists/${gistId}`, {
     method: 'PATCH',
     headers: {
@@ -212,7 +228,7 @@ async function updateGistFile(token: string, gistId: string, fileName: string, n
     body: JSON.stringify({
       files: {
         [fileName]: {
-          content: `${JSON.stringify({ version: 1, bookmarks: nodes }, null, 2)}\n`,
+          content: `${JSON.stringify(payload, null, 2)}\n`,
         },
       },
     }),
@@ -412,7 +428,7 @@ onMessage('validate-gist-auth', async ({ data }) => {
         public: false,
         files: {
           [fileName]: {
-            content: '{\"version\":1,\"bookmarks\":[]}\n',
+            content: `${JSON.stringify(buildBookmarkPayload([]), null, 2)}\n`,
           },
         },
       }),
@@ -479,7 +495,7 @@ onMessage('validate-gist-auth', async ({ data }) => {
       body: JSON.stringify({
         files: {
           [fileName]: {
-            content: '{\"version\":1,\"bookmarks\":[]}\n',
+            content: `${JSON.stringify(buildBookmarkPayload([]), null, 2)}\n`,
           },
         },
       }),

@@ -24,7 +24,14 @@ import { setupApp } from '~/logic/common-setup'
   shadowDOM.appendChild(styleEl)
   shadowDOM.appendChild(root)
   document.body.appendChild(container)
-  const app = createApp(App)
-  setupApp(app)
-  app.mount(root)
+
+  // Wait for CSS to load before mounting Vue app to prevent flash of unstyled content
+  const mountApp = () => {
+    const app = createApp(App)
+    setupApp(app)
+    app.mount(root)
+  }
+
+  styleEl.onload = mountApp
+  styleEl.onerror = mountApp // Mount anyway if CSS fails to load
 })()
