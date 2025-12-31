@@ -12,3 +12,7 @@ export const { data: gistLastSyncSummary, dataReady: gistLastSyncSummaryReady } 
 export const { data: syncDirection, dataReady: syncDirectionReady } = useWebExtensionStorage('sync-direction', 'pull')
 export const { data: syncConflictStrategy, dataReady: syncConflictStrategyReady } = useWebExtensionStorage('sync-conflict-strategy', 'gist-wins')
 export const { data: syncFolderSelection, dataReady: syncFolderSelectionReady } = useWebExtensionStorage<string[]>('sync-folder-selection', [])
+
+// 连接验证状态
+export const { data: connectionStatus, dataReady: connectionStatusReady } = useWebExtensionStorage<'ok' | 'error' | ''>('connection-status', '')
+export const { data: lastValidationTime, dataReady: lastValidationTimeReady } = useWebExtensionStorage<number>('last-validation-time', 0)

@@ -154,11 +154,14 @@ async function onPointerUp(event: PointerEvent) {
 }
 
 async function uploadBookmarks() {
-  await sendMessage("sync-upload", undefined, "background");
+  const result = await sendMessage("sync-upload", undefined, "background");
+  // 可以在这里添加简单的反馈，比如改变按钮颜色
+  console.log('Upload result:', result);
 }
 
 async function downloadBookmarks() {
-  await sendMessage("sync-download", undefined, "background");
+  const result = await sendMessage("sync-download", undefined, "background");
+  console.log('Download result:', result);
 }
 
 async function openSidePanel() {

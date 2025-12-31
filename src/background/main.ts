@@ -569,15 +569,32 @@ async function performSync(mode: 'upload' | 'download') {
   const selectedFolderIds = stored['sync-folder-selection'] as string[] | undefined
 
   if (!token || !gistId || !fileName) {
+    // 更新连接状态为错误
+    await browser.storage.local.set({
+      'connection-status': 'error',
+      'last-validation-time': Date.now(),
+    })
     return {
       ok: false,
-      error: 'Missing GitHub Token, Gist ID, or Gist file name',
+      error: '请先配置 GitHub Token、Gist ID 和文件名',
     }
   }
 
   const gistResult = await loadGistBookmarks(token, gistId, fileName)
-  if (!gistResult.ok)
+  if (!gistResult.ok) {
+    // 更新连接状态为错误
+    await browser.storage.local.set({
+      'connection-status': 'error',
+      'last-validation-time': Date.now(),
+    })
     return { ok: false, error: gistResult.error }
+  }
+
+  // 连接成功，更新状态
+  await browser.storage.local.set({
+    'connection-status': 'ok',
+    'last-validation-time': Date.now(),
+  })
 
   const localResult = await loadLocalNodes(selectedFolderIds)
   if (!localResult.ok)
