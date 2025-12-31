@@ -67,18 +67,28 @@ function toSyncNodes(nodes?: browser.bookmarks.BookmarkTreeNode[]): SyncNode[] {
   })
 }
 
-function filterLocalNodes(nodes: browser.bookmarks.BookmarkTreeNode[], selectedIds: Set<string>): SyncNode[] {
+function filterLocalNodes(
+  nodes: browser.bookmarks.BookmarkTreeNode[],
+  selectedIds: Set<string>,
+): SyncNode[] {
   const result: SyncNode[] = []
 
   for (const node of nodes) {
+    // 书签：检查父文件夹是否被选中（书签没有自己的 ID 在 selectedIds 中）
+    // 书签的包含由其所在文件夹决定，这里我们在文件夹层面处理
     if (node.url) {
+      // 书签直接添加（因为我们只会在选中的文件夹内递归调用此函数）
       result.push({ title: node.title || node.url, url: node.url })
       continue
     }
 
-    if (!selectedIds.has(node.id))
+    // 文件夹：检查是否被选中
+    if (!selectedIds.has(node.id)) {
+      // 文件夹未选中，跳过它及其所有内容
       continue
+    }
 
+    // 文件夹被选中，递归处理子节点
     const children = filterLocalNodes(node.children || [], selectedIds)
     result.push({
       title: node.title || 'Untitled',
@@ -194,17 +204,34 @@ async function loadLocalNodes(selectedFolderIds?: string[]) {
   const localTree = await browser.bookmarks.getTree()
   const root = localTree[0]
   if (!root)
-    return { ok: false, error: 'Failed to read local bookmarks' }
+    return { ok: false as const, error: 'Failed to read local bookmarks' }
 
   const selectedSet = new Set(selectedFolderIds || [])
-  let localNodes = selectedSet.size > 0
-    ? filterLocalNodes(root.children || [], selectedSet)
-    : toSyncNodes(root.children)
 
-  if (selectedSet.size > 0 && localNodes.length === 0)
-    localNodes = toSyncNodes(root.children)
+  // eslint-disable-next-line no-console
+  console.log('[GistSync] loadLocalNodes - selectedSet size:', selectedSet.size, 'ids:', Array.from(selectedSet))
 
-  return { ok: true, root, localNodes }
+  // 如果没有选择任何文件夹，返回所有书签
+  if (selectedSet.size === 0) {
+    // eslint-disable-next-line no-console
+    console.log('[GistSync] No folder selection, returning all bookmarks')
+    return { ok: true as const, root, localNodes: toSyncNodes(root.children) }
+  }
+
+  // 有选择的文件夹，进行过滤
+  const localNodes = filterLocalNodes(root.children || [], selectedSet)
+
+  // eslint-disable-next-line no-console
+  console.log('[GistSync] Filtered localNodes:', JSON.stringify(localNodes, null, 2))
+
+  // 如果过滤后为空（可能是选择状态异常），返回所有书签
+  if (localNodes.length === 0) {
+    // eslint-disable-next-line no-console
+    console.log('[GistSync] Filtered result is empty, returning all bookmarks')
+    return { ok: true as const, root, localNodes: toSyncNodes(root.children) }
+  }
+
+  return { ok: true as const, root, localNodes }
 }
 
 function buildBookmarkPayload(nodes: SyncNode[]) {
@@ -566,7 +593,24 @@ async function performSync(mode: 'upload' | 'download') {
   const fileName = (stored['gist-file-name'] as string | undefined)?.trim()
   const syncDirection = (stored['sync-direction'] as string | undefined) || 'pull'
   const conflictStrategy = (stored['sync-conflict-strategy'] as string | undefined) || 'gist-wins'
-  const selectedFolderIds = stored['sync-folder-selection'] as string[] | undefined
+
+  // sync-folder-selection 可能是字符串（JSON）或数组，需要正确解析
+  let selectedFolderIds: string[] | undefined
+  const rawSelection = stored['sync-folder-selection']
+  if (typeof rawSelection === 'string') {
+    try {
+      selectedFolderIds = JSON.parse(rawSelection)
+    }
+    catch {
+      selectedFolderIds = undefined
+    }
+  }
+  else if (Array.isArray(rawSelection)) {
+    selectedFolderIds = rawSelection
+  }
+
+  // eslint-disable-next-line no-console
+  console.log('[GistSync] selectedFolderIds from storage:', selectedFolderIds)
 
   if (!token || !gistId || !fileName) {
     // 更新连接状态为错误
@@ -600,22 +644,44 @@ async function performSync(mode: 'upload' | 'download') {
   if (!localResult.ok)
     return { ok: false, error: localResult.error }
 
-  const mergedNodes = mergeNodeLists(localResult.localNodes, gistResult.gistNodes)
+  const { root, localNodes } = localResult
 
   if (mode === 'upload') {
-    const updated = await updateGistFile(token, gistId, fileName, mergedNodes)
+    // 上传模式：只上传选中的本地书签到云端
+    const updated = await updateGistFile(token, gistId, fileName, localNodes)
     if (!updated)
-      return { ok: false, error: 'Failed to update Gist with merged data' }
+      return { ok: false, error: 'Failed to update Gist' }
+
+    const localCount = countBookmarks(localNodes)
+    const summary = `推送成功 ${localCount} 条书签`
+    const timestamp = new Date().toISOString()
+
+    await browser.storage.local.set({
+      'gist-bookmarks-cache': { version: 1, bookmarks: localNodes },
+      'gist-last-sync': timestamp,
+      'gist-last-sync-summary': summary,
+      'gist-last-sync-direction': syncDirection,
+      'gist-last-sync-strategy': conflictStrategy,
+      'gist-last-sync-folders': selectedFolderIds || [],
+    })
+
+    return {
+      ok: true,
+      summary,
+      timestamp,
+    }
   }
 
-  const index = await buildLocalIndex(localResult.root)
-  await ensureLocalEntries(localResult.root.id, index, mergedNodes)
+  // 下载模式：合并云端和本地书签
+  const mergedNodes = mergeNodeLists(localNodes, gistResult.gistNodes)
+
+  const index = await buildLocalIndex(root)
+  await ensureLocalEntries(root.id, index, mergedNodes)
 
   const gistCount = countBookmarks(gistResult.gistNodes)
-  const localCount = countBookmarks(localResult.localNodes)
+  const localCount = countBookmarks(localNodes)
   const mergedCount = countBookmarks(mergedNodes)
-  const actionLabel = mode === 'upload' ? 'Uploaded' : 'Downloaded'
-  const summary = `${actionLabel} ${mergedCount} items (gist ${gistCount}, local ${localCount})`
+  const summary = `拉取成功 ${mergedCount} 条书签 (云端 ${gistCount}, 本地 ${localCount})`
   const timestamp = new Date().toISOString()
 
   await browser.storage.local.set({
@@ -681,5 +747,48 @@ onMessage('open-sidepanel', ({ sender }) => {
   }
   catch {
     return { ok: false, error: 'Failed to open side panel' }
+  }
+})
+
+onMessage('clear-bookmarks', async () => {
+  try {
+    const tree = await browser.bookmarks.getTree()
+    const root = tree[0]
+    if (!root)
+      return { ok: false, success: false, error: 'Failed to read bookmarks' }
+
+    // 递归删除所有书签和文件夹（保留根节点的直接子文件夹如"书签栏"、"其他书签"）
+    async function clearFolder(node: browser.bookmarks.BookmarkTreeNode) {
+      if (!node.children)
+        return
+
+      for (const child of node.children) {
+        if (child.url) {
+          // 删除书签
+          await browser.bookmarks.remove(child.id)
+        }
+        else if (child.children) {
+          // 递归清空子文件夹内容
+          await clearFolder(child)
+          // 如果不是根级文件夹（书签栏、其他书签等），则删除空文件夹
+          if (child.parentId !== root.id) {
+            await browser.bookmarks.remove(child.id)
+          }
+        }
+      }
+    }
+
+    // 清空每个根级文件夹的内容
+    for (const rootFolder of root.children || []) {
+      await clearFolder(rootFolder)
+    }
+
+    // 清除保存的文件夹选择状态，这样下次下载时会是全选状态
+    await browser.storage.local.remove('sync-folder-selection')
+
+    return { ok: true, success: true }
+  }
+  catch (error) {
+    return { ok: false, success: false, error: String(error) }
   }
 })

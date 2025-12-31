@@ -89,9 +89,9 @@ function onToggle(node: FolderNode, event: Event) {
 .tree__label {
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 3px 5px;
-  border-radius: 5px;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 6px;
   cursor: pointer;
   transition: background 0.15s;
 }
@@ -132,9 +132,9 @@ function onToggle(node: FolderNode, event: Event) {
 }
 
 .tree__check {
-  width: 13px;
-  height: 13px;
-  border-radius: 3px;
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
   border: 1.5px solid rgba(0, 0, 0, 0.2);
   display: grid;
   place-items: center;
@@ -161,12 +161,12 @@ function onToggle(node: FolderNode, event: Event) {
 }
 
 .tree__check-icon {
-  font-size: 9px;
+  font-size: 10px;
   color: white;
 }
 
 .tree__folder {
-  font-size: 12px;
+  font-size: 14px;
   color: #9a918a;
   flex-shrink: 0;
 }
@@ -189,7 +189,7 @@ function onToggle(node: FolderNode, event: Event) {
 
 .tree__title {
   flex: 1;
-  font-size: 11px;
+  font-size: 13px;
   color: #1a1816;
   white-space: nowrap;
   overflow: hidden;
@@ -203,11 +203,11 @@ function onToggle(node: FolderNode, event: Event) {
 }
 
 .tree__count {
-  font-size: 9px;
+  font-size: 11px;
   color: #9a918a;
-  padding: 1px 4px;
+  padding: 2px 6px;
   background: rgba(0, 0, 0, 0.04);
-  border-radius: 6px;
+  border-radius: 8px;
 }
 
 @media (prefers-color-scheme: dark) {
