@@ -792,3 +792,81 @@ onMessage('clear-bookmarks', async () => {
     return { ok: false, success: false, error: String(error) }
   }
 })
+
+onMessage('export-bookmarks', async ({ data }) => {
+  try {
+    const includeExcluded = data?.includeExcluded ?? true
+
+    const localTree = await browser.bookmarks.getTree()
+    const root = localTree[0]
+    if (!root)
+      return { ok: false, error: 'Failed to read bookmarks' }
+
+    let bookmarks: SyncNode[]
+
+    if (includeExcluded) {
+      // 导出全部书签
+      bookmarks = toSyncNodes(root.children)
+    }
+    else {
+      // 只导出选中的书签（排除未选中的）
+      const stored = await browser.storage.local.get(['sync-folder-selection'])
+      let selectedFolderIds: string[] | undefined
+      const rawSelection = stored['sync-folder-selection']
+      if (typeof rawSelection === 'string') {
+        try {
+          selectedFolderIds = JSON.parse(rawSelection)
+        }
+        catch {
+          selectedFolderIds = undefined
+        }
+      }
+      else if (Array.isArray(rawSelection)) {
+        selectedFolderIds = rawSelection
+      }
+
+      const selectedSet = new Set(selectedFolderIds || [])
+      if (selectedSet.size === 0) {
+        bookmarks = toSyncNodes(root.children)
+      }
+      else {
+        bookmarks = filterLocalNodes(root.children || [], selectedSet)
+      }
+    }
+
+    const payload = {
+      browser: navigator.userAgent,
+      version: browser.runtime.getManifest().version,
+      createDate: Date.now(),
+      exportType: includeExcluded ? 'full' : 'selected',
+      bookmarks,
+    }
+
+    return { ok: true, data: payload, count: countBookmarks(bookmarks) }
+  }
+  catch (error) {
+    return { ok: false, error: String(error) }
+  }
+})
+
+onMessage('import-bookmarks', async ({ data }) => {
+  try {
+    const bookmarks = data?.bookmarks as SyncNode[] | undefined
+    if (!Array.isArray(bookmarks))
+      return { ok: false, error: '无效的书签数据' }
+
+    const localTree = await browser.bookmarks.getTree()
+    const root = localTree[0]
+    if (!root)
+      return { ok: false, error: 'Failed to read bookmarks' }
+
+    const index = await buildLocalIndex(root)
+    await ensureLocalEntries(root.id, index, bookmarks)
+
+    const count = countBookmarks(bookmarks)
+    return { ok: true, count }
+  }
+  catch (error) {
+    return { ok: false, error: String(error) }
+  }
+})

@@ -21,11 +21,18 @@ async function stubIndexHtml() {
   }
 }
 
+async function copyAssets() {
+  await fs.ensureDir(r('extension/assets'))
+  await fs.copy(r('src/assets'), r('extension/assets'), { overwrite: true })
+  log('PRE', 'copy assets')
+}
+
 function writeManifest() {
   execSync('npx esno ./scripts/manifest.ts', { stdio: 'inherit' })
 }
 
 writeManifest()
+copyAssets()
 
 if (isDev) {
   stubIndexHtml()
@@ -36,5 +43,9 @@ if (isDev) {
   chokidar.watch([r('src/manifest.ts'), r('package.json')])
     .on('change', () => {
       writeManifest()
+    })
+  chokidar.watch(r('src/assets/**/*'))
+    .on('change', () => {
+      copyAssets()
     })
 }

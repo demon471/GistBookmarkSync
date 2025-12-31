@@ -283,6 +283,73 @@ function importConfig() {
   input.click()
 }
 
+// 书签导出
+const exportModalVisible = ref(false)
+const exportIncludeExcluded = ref(true)
+
+function showExportModal() {
+  exportModalVisible.value = true
+}
+
+async function doExportBookmarks() {
+  exportModalVisible.value = false
+  try {
+    const result = await sendMessage('export-bookmarks', { includeExcluded: exportIncludeExcluded.value }, 'background') as { ok: boolean, error?: string, data?: unknown, count?: number }
+    if (!result.ok) {
+      showToast(result.error || '导出失败', 'error')
+      return
+    }
+
+    const blob = new Blob([JSON.stringify(result.data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    const suffix = exportIncludeExcluded.value ? 'full' : 'selected'
+    a.download = `bookmarks-${suffix}-${new Date().toISOString().slice(0, 10)}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+    showToast(`已导出 ${result.count} 条书签`, 'success')
+  }
+  catch (error) {
+    showToast(error instanceof Error ? error.message : '导出失败', 'error')
+  }
+}
+
+// 书签导入
+function importBookmarks() {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = '.json'
+  input.onchange = async (e) => {
+    const file = (e.target as HTMLInputElement).files?.[0]
+    if (!file) return
+    try {
+      const text = await file.text()
+      const data = JSON.parse(text)
+
+      // 支持两种格式：直接的书签数组或带 bookmarks 字段的对象
+      const bookmarks = Array.isArray(data) ? data : data.bookmarks
+      if (!Array.isArray(bookmarks)) {
+        showToast('无效的书签文件格式', 'error')
+        return
+      }
+
+      const result = await sendMessage('import-bookmarks', { bookmarks }, 'background') as { ok: boolean, error?: string, count?: number }
+      if (result.ok) {
+        showToast(`已导入 ${result.count} 条书签`, 'success')
+        void loadFolderTree()
+      }
+      else {
+        showToast(result.error || '导入失败', 'error')
+      }
+    }
+    catch {
+      showToast('书签文件格式错误', 'error')
+    }
+  }
+  input.click()
+}
+
 function collectFolderIds(nodes: FolderNode[]) {
   const ids: string[] = []
   for (const node of nodes) {
@@ -478,6 +545,23 @@ onMounted(() => {
 
     <section class="card">
       <div class="card__header">
+        <ph-bookmarks class="card__icon" />
+        <h2 class="card__title">书签管理</h2>
+      </div>
+      <div class="action-grid">
+        <button class="action-tile action-tile--teal" @click="importBookmarks">
+          <span class="action-tile__icon"><ph-file-arrow-down /></span>
+          <span class="action-tile__label">导入书签</span>
+        </button>
+        <button class="action-tile action-tile--orange" @click="showExportModal">
+          <span class="action-tile__icon"><ph-file-arrow-up /></span>
+          <span class="action-tile__label">导出书签</span>
+        </button>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card__header">
         <ph-folder-open class="card__icon" />
         <h2 class="card__title">同步范围</h2>
         <button class="btn btn--ghost" :disabled="folderTreeState === 'loading'" @click="loadFolderTree">
@@ -512,6 +596,40 @@ onMounted(() => {
         <ph-check-circle v-if="toastType === 'success'" class="toast__icon" />
         <ph-warning-circle v-else class="toast__icon" />
         <span class="toast__message">{{ toastMessage }}</span>
+      </div>
+    </Transition>
+
+    <!-- 导出书签弹窗 -->
+    <Transition name="modal">
+      <div v-if="exportModalVisible" class="modal-overlay" @click.self="exportModalVisible = false">
+        <div class="modal">
+          <div class="modal__header">
+            <ph-file-arrow-up class="modal__icon" />
+            <h3 class="modal__title">导出书签</h3>
+          </div>
+          <div class="modal__body">
+            <label class="radio-option">
+              <input v-model="exportIncludeExcluded" type="radio" :value="true" class="radio-option__input">
+              <span class="radio-option__mark" />
+              <span class="radio-option__content">
+                <span class="radio-option__label">导出全部书签</span>
+                <span class="radio-option__hint">包含所有书签，共 {{ bookmarkStats.total }} 条</span>
+              </span>
+            </label>
+            <label class="radio-option">
+              <input v-model="exportIncludeExcluded" type="radio" :value="false" class="radio-option__input">
+              <span class="radio-option__mark" />
+              <span class="radio-option__content">
+                <span class="radio-option__label">仅导出已选书签</span>
+                <span class="radio-option__hint">排除未选中的文件夹，共 {{ bookmarkStats.selected }} 条</span>
+              </span>
+            </label>
+          </div>
+          <div class="modal__footer">
+            <button class="btn btn--ghost" @click="exportModalVisible = false">取消</button>
+            <button class="btn btn--primary" @click="doExportBookmarks">导出</button>
+          </div>
+        </div>
       </div>
     </Transition>
   </main>
@@ -951,6 +1069,16 @@ onMounted(() => {
   box-shadow: 0 3px 10px rgba(124, 58, 237, 0.3);
 }
 
+.action-tile--teal {
+  background: linear-gradient(135deg, #14b8a6 0%, #5eead4 100%);
+  box-shadow: 0 3px 10px rgba(20, 184, 166, 0.3);
+}
+
+.action-tile--orange {
+  background: linear-gradient(135deg, #f97316 0%, #fb923c 100%);
+  box-shadow: 0 3px 10px rgba(249, 115, 22, 0.3);
+}
+
 /* Message */
 .message {
   display: flex;
@@ -1141,5 +1269,149 @@ onMounted(() => {
 .toast-leave-to {
   opacity: 0;
   transform: translateX(-50%) translateY(20px);
+}
+
+/* Modal */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 16px;
+}
+
+.modal {
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 16px;
+  width: 100%;
+  max-width: 320px;
+  overflow: hidden;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+
+.modal__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px;
+  border-bottom: 1px solid var(--card-border);
+}
+
+.modal__icon {
+  font-size: 18px;
+  color: var(--accent);
+}
+
+.modal__title {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+  color: var(--ink);
+}
+
+.modal__body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.modal__footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--card-border);
+  background: var(--input-bg);
+}
+
+/* Radio Option */
+.radio-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.radio-option:hover {
+  border-color: var(--accent);
+}
+
+.radio-option__input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.radio-option__mark {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--input-border);
+  flex-shrink: 0;
+  margin-top: 1px;
+  transition: border-color 0.15s;
+  position: relative;
+}
+
+.radio-option__mark::after {
+  content: '';
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: scale(0);
+  transition: transform 0.15s;
+}
+
+.radio-option__input:checked + .radio-option__mark {
+  border-color: var(--accent);
+}
+
+.radio-option__input:checked + .radio-option__mark::after {
+  transform: scale(1);
+}
+
+.radio-option__content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.radio-option__label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.radio-option__hint {
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
+/* Modal 动画 */
+.modal-enter-active,
+.modal-leave-active {
+  transition: all 0.2s ease;
+}
+
+.modal-enter-from,
+.modal-leave-to {
+  opacity: 0;
+}
+
+.modal-enter-from .modal,
+.modal-leave-to .modal {
+  transform: scale(0.95);
 }
 </style>

@@ -1,0 +1,75 @@
+name: 构建扩展 CRX 并附加到 Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-crx:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: 设置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建扩展
+        run: pnpm build
+
+      - name: 读取包名和版本号
+        id: pkg
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 打包 ZIP
+        run: pnpm pack:zip
+
+      - name: 重命名 ZIP 文件
+        run: |
+          mkdir -p dist
+          mv extension.zip "dist/${{ steps.pkg.outputs.name }}-${{ steps.pkg.outputs.version }}-chrome.zip"
+
+      - name: 生成 CRX
+        id: build_crx
+        uses: cardinalby/webext-buildtools-chrome-crx-action@v2
+        with:
+          zipFilePath: "dist/${{ steps.pkg.outputs.name }}-${{ steps.pkg.outputs.version }}-chrome.zip"
+          crxFilePath: "dist/${{ steps.pkg.outputs.name }}-${{ steps.pkg.outputs.version }}-chrome.crx"
+          privateKey: ${{ secrets.CRX_PRIVATE_KEY }}
+
+      - name: 上传 ZIP 到 Release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: "dist/${{ steps.pkg.outputs.name }}-${{ steps.pkg.outputs.version }}-chrome.zip"
+          asset_name: ${{ steps.pkg.outputs.name }}-${{ steps.pkg.outputs.version }}-chrome.zip
+          tag: ${{ github.ref_name }}
+          overwrite: true
+
+      - name: 上传 CRX 到 Release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: "dist/${{ steps.pkg.outputs.name }}-${{ steps.pkg.outputs.version }}-chrome.crx"
+          asset_name: ${{ steps.pkg.outputs.name }}-${{ steps.pkg.outputs.version }}-chrome.crx
+          tag: ${{ github.ref_name }}
+          overwrite: true
