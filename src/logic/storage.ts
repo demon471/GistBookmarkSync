@@ -15,6 +15,17 @@ export const { data: syncFolderSelection, dataReady: syncFolderSelectionReady } 
 export const { data: syncIntervalMinutes, dataReady: syncIntervalMinutesReady } = useWebExtensionStorage<number>('sync-interval-minutes', 0)
 export const { data: syncProvider, dataReady: syncProviderReady } = useWebExtensionStorage<'gist' | 'webdav'>('sync-provider', 'gist')
 
+export interface SyncLogEntry {
+  id: string
+  time: string
+  provider: 'gist' | 'webdav'
+  mode: 'upload' | 'download'
+  status: 'ok' | 'error'
+  summary: string
+}
+
+export const { data: syncLogs, dataReady: syncLogsReady } = useWebExtensionStorage<SyncLogEntry[]>('sync-log', [])
+
 export const { data: webdavUrl, dataReady: webdavUrlReady } = useWebExtensionStorage('webdav-url', '')
 export const { data: webdavUsername, dataReady: webdavUsernameReady } = useWebExtensionStorage('webdav-username', '')
 export const { data: webdavPassword, dataReady: webdavPasswordReady } = useWebExtensionStorage('webdav-password', '')

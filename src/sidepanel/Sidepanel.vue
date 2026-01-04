@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMessage, sendMessage } from 'webext-bridge/popup'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   connectionStatus,
   connectionStatusReady,
@@ -14,6 +14,8 @@ import {
   syncFolderSelectionReady,
   syncIntervalMinutes,
   syncIntervalMinutesReady,
+  syncLogs,
+  syncLogsReady,
   syncProvider,
   syncProviderReady,
   webdavConnectionStatus,
@@ -24,8 +26,9 @@ import {
   webdavUrlReady,
   webdavUsername,
 } from '~/logic/storage'
+import type { SyncLogEntry } from '~/logic/storage'
 
-type FolderNode = {
+interface FolderNode {
   id: string
   title: string
   count: number
@@ -47,10 +50,28 @@ const webdavVersionsState = ref<'idle' | 'loading' | 'error'>('idle')
 const webdavVersionsMessage = ref('')
 const webdavVersions = ref<Array<{ file: string, timestamp: string, count?: number }>>([])
 let downloadClickTimer: ReturnType<typeof setTimeout> | null = null
+const intervalDropdownOpen = ref(false)
+const intervalDropdownRef = ref<HTMLElement | null>(null)
+const intervalDropdownTriggerRef = ref<HTMLElement | null>(null)
+const intervalDropdownMenuRef = ref<HTMLElement | null>(null)
+const intervalDropdownStyle = ref<Record<string, string>>({})
+const syncLogVisible = ref(false)
+const syncLogReady = ref(false)
 
 const activeValidationState = computed(() => {
   return syncProvider.value === 'webdav' ? webdavValidationState.value : gistValidationState.value
 })
+
+const syncIntervalOptions = [
+  { value: 0, label: '无' },
+  { value: 1, label: '1 分钟' },
+  { value: 5, label: '5 分钟' },
+  { value: 15, label: '15 分钟' },
+  { value: 30, label: '30 分钟' },
+  { value: 60, label: '1 小时' },
+  { value: 120, label: '2 小时' },
+  { value: 180, label: '3 小时' },
+]
 
 const providerTitle = computed(() => {
   return syncProvider.value === 'webdav' ? 'WebDAV Sync' : 'Gist Sync'
@@ -60,8 +81,108 @@ const providerSubtitle = computed(() => {
   return syncProvider.value === 'webdav' ? '书签 WebDAV 同步' : '书签云同步'
 })
 
+const syncIntervalLabel = computed(() => {
+  return syncIntervalOptions.find(item => item.value === syncIntervalMinutes.value)?.label ?? '未设置'
+})
+
+const recentSyncLogs = computed(() => {
+  if (!Array.isArray(syncLogs.value))
+    return []
+  return syncLogs.value.slice(0, 5)
+})
+
+function openSyncLog() {
+  syncLogVisible.value = true
+}
+
+function formatSyncLogTime(time: string) {
+  const date = new Date(time)
+  if (Number.isNaN(date.getTime()))
+    return time
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hour = String(date.getHours()).padStart(2, '0')
+  const minute = String(date.getMinutes()).padStart(2, '0')
+  return `${year}-${month}-${day} ${hour}:${minute}`
+}
+
+function formatSyncLogTitle(entry: SyncLogEntry) {
+  const providerLabel = entry.provider === 'webdav' ? 'WebDAV' : 'Gist'
+  const modeLabel = entry.mode === 'upload' ? '推送' : '拉取'
+  const statusLabel = entry.status === 'ok' ? '成功' : '失败'
+  return `${providerLabel} · ${modeLabel} · ${statusLabel}`
+}
+
+function toggleIntervalDropdown() {
+  intervalDropdownOpen.value = !intervalDropdownOpen.value
+  if (intervalDropdownOpen.value)
+    void positionIntervalDropdown()
+}
+
+function selectInterval(value: number) {
+  syncIntervalMinutes.value = value
+  intervalDropdownOpen.value = false
+}
+
+function handleIntervalDropdownOutside(event: MouseEvent) {
+  const target = event.target as Node | null
+  if (!intervalDropdownRef.value || !target)
+    return
+  if (!intervalDropdownRef.value.contains(target))
+    intervalDropdownOpen.value = false
+}
+
+function handleIntervalEsc(event: KeyboardEvent) {
+  if (event.key === 'Escape')
+    intervalDropdownOpen.value = false
+}
+
+async function positionIntervalDropdown() {
+  await nextTick()
+  const trigger = intervalDropdownTriggerRef.value
+  const menu = intervalDropdownMenuRef.value
+  if (!trigger || !menu) {
+    requestAnimationFrame(() => {
+      if (intervalDropdownOpen.value)
+        void positionIntervalDropdown()
+    })
+    return
+  }
+  const rect = trigger.getBoundingClientRect()
+  const viewportWidth = window.innerWidth
+  const viewportHeight = window.innerHeight
+
+  // 先让菜单实际渲染以获取高度
+  const menuHeight = Math.min(menu.scrollHeight, 260)
+  let top = rect.bottom + 8
+  if (top + menuHeight > viewportHeight - 8)
+    top = Math.max(8, rect.top - 8 - menuHeight)
+
+  let left = rect.left
+  const maxLeft = Math.max(8, viewportWidth - rect.width - 8)
+  left = Math.min(Math.max(8, left), maxLeft)
+
+  intervalDropdownStyle.value = {
+    top: `${top}px`,
+    left: `${left}px`,
+    width: `${rect.width}px`,
+  }
+}
+
+function handleIntervalResize() {
+  if (intervalDropdownOpen.value)
+    void positionIntervalDropdown()
+}
+
+function handleIntervalScroll() {
+  if (intervalDropdownOpen.value)
+    void positionIntervalDropdown()
+}
+
 async function resolveTabId() {
-  if (currentTabId.value !== null) return
+  if (currentTabId.value !== null)
+    return
   try {
     const tabs = await browser.tabs.query({ active: true, currentWindow: true })
     const tabId = tabs[0]?.id
@@ -75,13 +196,15 @@ async function resolveTabId() {
 
 async function notifySidepanelOpen() {
   await resolveTabId()
-  if (currentTabId.value === null) return
+  if (currentTabId.value === null)
+    return
   void sendMessage('sidepanel-visibility', { open: true, tabId: currentTabId.value }, 'background')
 }
 
 async function notifySidepanelClosed() {
   await resolveTabId()
-  if (currentTabId.value === null) return
+  if (currentTabId.value === null)
+    return
   void sendMessage('sidepanel-visibility', { open: false, tabId: currentTabId.value }, 'background')
 }
 
@@ -93,19 +216,32 @@ onMounted(() => {
   void notifySidepanelOpen()
   window.addEventListener('pagehide', handleSidepanelHide)
   window.addEventListener('beforeunload', handleSidepanelHide)
+  window.addEventListener('click', handleIntervalDropdownOutside)
+  window.addEventListener('keydown', handleIntervalEsc)
+  window.addEventListener('resize', handleIntervalResize)
+  window.addEventListener('scroll', handleIntervalScroll, { passive: true })
+  syncLogsReady.then(() => {
+    syncLogReady.value = true
+  })
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('pagehide', handleSidepanelHide)
   window.removeEventListener('beforeunload', handleSidepanelHide)
   void notifySidepanelClosed()
+  window.removeEventListener('click', handleIntervalDropdownOutside)
+  window.removeEventListener('keydown', handleIntervalEsc)
+  window.removeEventListener('resize', handleIntervalResize)
+  window.removeEventListener('scroll', handleIntervalScroll)
 })
 
 // 检测同步范围是否有未保存的变化
 const hasUnsavedChanges = computed(() => {
-  if (selectedFolderIds.value.size !== savedFolderIds.value.size) return true
+  if (selectedFolderIds.value.size !== savedFolderIds.value.size)
+    return true
   for (const id of selectedFolderIds.value) {
-    if (!savedFolderIds.value.has(id)) return true
+    if (!savedFolderIds.value.has(id))
+      return true
   }
   return false
 })
@@ -117,7 +253,8 @@ const toastType = ref<'success' | 'error'>('success')
 let toastTimer: ReturnType<typeof setTimeout> | null = null
 
 function showToast(message: string, type: 'success' | 'error' = 'success') {
-  if (toastTimer) clearTimeout(toastTimer)
+  if (toastTimer)
+    clearTimeout(toastTimer)
   toastMessage.value = message
   toastType.value = type
   toastVisible.value = true
@@ -581,18 +718,25 @@ function importConfig() {
   input.accept = '.json'
   input.onchange = async (e) => {
     const file = (e.target as HTMLInputElement).files?.[0]
-    if (!file) return
+    if (!file)
+      return
     try {
       const text = await file.text()
       const config = JSON.parse(text)
       if (config.syncProvider === 'webdav' || config.syncProvider === 'gist')
         syncProvider.value = config.syncProvider
-      if (config.githubToken) githubToken.value = config.githubToken
-      if (config.gistId) gistId.value = config.gistId
-      if (config.gistFileName) gistFileName.value = config.gistFileName
-      if (config.webdavUrl) webdavUrl.value = config.webdavUrl
-      if (config.webdavUsername) webdavUsername.value = config.webdavUsername
-      if (config.webdavPassword) webdavPassword.value = config.webdavPassword
+      if (config.githubToken)
+        githubToken.value = config.githubToken
+      if (config.gistId)
+        gistId.value = config.gistId
+      if (config.gistFileName)
+        gistFileName.value = config.gistFileName
+      if (config.webdavUrl)
+        webdavUrl.value = config.webdavUrl
+      if (config.webdavUsername)
+        webdavUsername.value = config.webdavUsername
+      if (config.webdavPassword)
+        webdavPassword.value = config.webdavPassword
       if (typeof config.syncIntervalMinutes === 'number')
         syncIntervalMinutes.value = config.syncIntervalMinutes
       if (Array.isArray(config.syncFolderSelection)) {
@@ -647,7 +791,8 @@ function importBookmarks() {
   input.accept = '.json'
   input.onchange = async (e) => {
     const file = (e.target as HTMLInputElement).files?.[0]
-    if (!file) return
+    if (!file)
+      return
     try {
       const text = await file.text()
       const data = JSON.parse(text)
@@ -828,6 +973,11 @@ watch(syncProvider, (nextProvider) => {
       void checkConnection()
   }
 })
+
+watch(intervalDropdownOpen, (open) => {
+  if (open)
+    void positionIntervalDropdown()
+})
 </script>
 
 <template>
@@ -838,8 +988,12 @@ watch(syncProvider, (nextProvider) => {
           <ph-cloud-arrow-up class="panel__logo-icon" />
         </div>
         <div>
-          <h1 class="panel__title">{{ providerTitle }}</h1>
-          <p class="panel__subtitle">{{ providerSubtitle }}</p>
+          <h1 class="panel__title">
+            {{ providerTitle }}
+          </h1>
+          <p class="panel__subtitle">
+            {{ providerSubtitle }}
+          </p>
         </div>
       </div>
       <div class="panel__status" :data-state="activeValidationState">
@@ -872,7 +1026,9 @@ watch(syncProvider, (nextProvider) => {
     <section class="card">
       <div class="card__header">
         <ph-plugs-connected class="card__icon" />
-        <h2 class="card__title">连接配置</h2>
+        <h2 class="card__title">
+          连接配置
+        </h2>
       </div>
       <div class="provider-tabs">
         <button
@@ -914,18 +1070,47 @@ watch(syncProvider, (nextProvider) => {
           <input v-model="gistFileName" placeholder="bookmarks" class="input">
         </div>
         <div class="field">
-          <label class="field__label">
+          <label class="field__label" @dblclick="openSyncLog">
             <ph-timer class="field__icon" />
             自动拉取间隔
           </label>
-          <select v-model.number="syncIntervalMinutes" class="input">
-            <option :value="0">无</option>
-            <option :value="1">1 分钟</option>
-            <option :value="5">5 分钟</option>
-            <option :value="30">30 分钟</option>
-            <option :value="60">1 小时</option>
-            <option :value="180">3 小时</option>
-          </select>
+          <div ref="intervalDropdownRef" class="select-input" :class="{ 'is-open': intervalDropdownOpen }">
+            <button
+              ref="intervalDropdownTriggerRef"
+              type="button"
+              class="select-input__trigger input"
+              :aria-expanded="intervalDropdownOpen"
+              @click.stop="toggleIntervalDropdown"
+            >
+              <span class="select-input__value">{{ syncIntervalLabel }}</span>
+              <ph-caret-down class="select-input__arrow" />
+            </button>
+            <Transition name="fade">
+              <teleport to="body">
+                <div
+                  v-if="intervalDropdownOpen"
+                  ref="intervalDropdownMenuRef"
+                  class="select-menu"
+                  role="listbox"
+                  :style="intervalDropdownStyle"
+                >
+                  <button
+                    v-for="option in syncIntervalOptions"
+                    :key="option.value"
+                    type="button"
+                    class="select-option"
+                    :class="{ 'is-active': option.value === syncIntervalMinutes }"
+                    role="option"
+                    :aria-selected="option.value === syncIntervalMinutes"
+                    @click.stop="selectInterval(option.value)"
+                  >
+                    <span>{{ option.label }}</span>
+                    <ph-check v-if="option.value === syncIntervalMinutes" class="select-option__check" />
+                  </button>
+                </div>
+              </teleport>
+            </Transition>
+          </div>
         </div>
         <button class="btn btn--primary btn--input" :disabled="gistValidationState === 'checking'" @click="validateGistAuth">
           <ph-floppy-disk v-if="gistValidationState !== 'checking'" class="btn__icon" />
@@ -957,18 +1142,47 @@ watch(syncProvider, (nextProvider) => {
           <input v-model="webdavPassword" type="password" placeholder="可选" class="input">
         </div>
         <div class="field">
-          <label class="field__label">
+          <label class="field__label" @dblclick="openSyncLog">
             <ph-timer class="field__icon" />
             自动拉取间隔
           </label>
-          <select v-model.number="syncIntervalMinutes" class="input">
-            <option :value="0">无</option>
-            <option :value="1">1 分钟</option>
-            <option :value="5">5 分钟</option>
-            <option :value="30">30 分钟</option>
-            <option :value="60">1 小时</option>
-            <option :value="180">3 小时</option>
-          </select>
+          <div ref="intervalDropdownRef" class="select-input" :class="{ 'is-open': intervalDropdownOpen }">
+            <button
+              ref="intervalDropdownTriggerRef"
+              type="button"
+              class="select-input__trigger input"
+              :aria-expanded="intervalDropdownOpen"
+              @click.stop="toggleIntervalDropdown"
+            >
+              <span class="select-input__value">{{ syncIntervalLabel }}</span>
+              <ph-caret-down class="select-input__arrow" />
+            </button>
+            <Transition name="fade">
+              <teleport to="body">
+                <div
+                  v-if="intervalDropdownOpen"
+                  ref="intervalDropdownMenuRef"
+                  class="select-menu"
+                  role="listbox"
+                  :style="intervalDropdownStyle"
+                >
+                  <button
+                    v-for="option in syncIntervalOptions"
+                    :key="option.value"
+                    type="button"
+                    class="select-option"
+                    :class="{ 'is-active': option.value === syncIntervalMinutes }"
+                    role="option"
+                    :aria-selected="option.value === syncIntervalMinutes"
+                    @click.stop="selectInterval(option.value)"
+                  >
+                    <span>{{ option.label }}</span>
+                    <ph-check v-if="option.value === syncIntervalMinutes" class="select-option__check" />
+                  </button>
+                </div>
+              </teleport>
+            </Transition>
+          </div>
         </div>
         <button class="btn btn--primary btn--input" :disabled="webdavValidationState === 'checking'" @click="validateWebdavAuth">
           <ph-floppy-disk v-if="webdavValidationState !== 'checking'" class="btn__icon" />
@@ -981,7 +1195,9 @@ watch(syncProvider, (nextProvider) => {
     <section class="card">
       <div class="card__header">
         <ph-squares-four class="card__icon" />
-        <h2 class="card__title">快捷操作</h2>
+        <h2 class="card__title">
+          快捷操作
+        </h2>
       </div>
       <div class="action-grid">
         <button class="action-tile action-tile--blue" @click="importConfig">
@@ -1017,7 +1233,9 @@ watch(syncProvider, (nextProvider) => {
     <section class="card">
       <div class="card__header">
         <ph-bookmarks class="card__icon" />
-        <h2 class="card__title">书签管理</h2>
+        <h2 class="card__title">
+          书签管理
+        </h2>
       </div>
       <div class="action-grid">
         <button class="action-tile action-tile--teal" @click="importBookmarks">
@@ -1034,7 +1252,9 @@ watch(syncProvider, (nextProvider) => {
     <section class="card">
       <div class="card__header">
         <ph-folder-open class="card__icon" />
-        <h2 class="card__title">同步范围</h2>
+        <h2 class="card__title">
+          同步范围
+        </h2>
         <button class="btn btn--ghost" :disabled="folderTreeState === 'loading'" @click="loadFolderTree">
           <ph-arrows-clockwise class="btn__icon" :class="{ 'btn__icon--spin': folderTreeState === 'loading' }" />
         </button>
@@ -1044,7 +1264,9 @@ watch(syncProvider, (nextProvider) => {
           <span v-if="hasUnsavedChanges" class="unsaved-dot" />
         </button>
       </div>
-      <p class="card__hint">选择需要同步的书签文件夹</p>
+      <p class="card__hint">
+        选择需要同步的书签文件夹
+      </p>
       <div v-if="folderTreeState === 'loading' && folderTree.length === 0" class="tree-loading">
         <ph-circle-notch class="tree-loading__icon" />
         <span>加载书签…</span>
@@ -1076,7 +1298,9 @@ watch(syncProvider, (nextProvider) => {
         <div class="modal">
           <div class="modal__header">
             <ph-file-arrow-up class="modal__icon" />
-            <h3 class="modal__title">导出书签</h3>
+            <h3 class="modal__title">
+              导出书签
+            </h3>
           </div>
           <div class="modal__body">
             <label class="radio-option">
@@ -1097,8 +1321,12 @@ watch(syncProvider, (nextProvider) => {
             </label>
           </div>
           <div class="modal__footer">
-            <button class="btn btn--ghost" @click="exportModalVisible = false">取消</button>
-            <button class="btn btn--primary" @click="doExportBookmarks">导出</button>
+            <button class="btn btn--ghost" @click="exportModalVisible = false">
+              取消
+            </button>
+            <button class="btn btn--primary" @click="doExportBookmarks">
+              导出
+            </button>
           </div>
         </div>
       </div>
@@ -1110,7 +1338,9 @@ watch(syncProvider, (nextProvider) => {
         <div class="modal">
           <div class="modal__header">
             <ph-clock-counter-clockwise class="modal__icon" />
-            <h3 class="modal__title">历史版本</h3>
+            <h3 class="modal__title">
+              历史版本
+            </h3>
           </div>
           <div class="modal__body">
             <div v-if="webdavVersionsState === 'loading' && webdavVersions.length === 0" class="tree-loading">
@@ -1152,7 +1382,52 @@ watch(syncProvider, (nextProvider) => {
             </div>
           </div>
           <div class="modal__footer">
-            <button class="btn btn--ghost" @click="webdavVersionsVisible = false">关闭</button>
+            <button class="btn btn--ghost" @click="webdavVersionsVisible = false">
+              关闭
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- 同步日志 -->
+    <Transition name="modal">
+      <div v-if="syncLogVisible" class="modal-overlay" @click.self="syncLogVisible = false">
+        <div class="modal">
+          <div class="modal__header">
+            <ph-list-bullets class="modal__icon" />
+            <h3 class="modal__title">
+              同步日志
+            </h3>
+          </div>
+          <div class="modal__body">
+            <div v-if="!syncLogReady" class="tree-loading">
+              <ph-circle-notch class="tree-loading__icon" />
+              <span>加载日志…</span>
+            </div>
+            <div v-else-if="recentSyncLogs.length === 0" class="message" data-state="info">
+              暂无同步记录
+            </div>
+            <div v-else class="sync-log-list">
+              <div v-for="item in recentSyncLogs" :key="item.id" class="sync-log-item" :data-status="item.status">
+                <div class="sync-log-main">
+                  <div class="sync-log-title">
+                    {{ formatSyncLogTitle(item) }}
+                  </div>
+                  <div class="sync-log-summary">
+                    {{ item.summary }}
+                  </div>
+                </div>
+                <div class="sync-log-time">
+                  {{ formatSyncLogTime(item.time) }}
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="modal__footer">
+            <button class="btn btn--ghost" @click="syncLogVisible = false">
+              关闭
+            </button>
           </div>
         </div>
       </div>
@@ -1160,8 +1435,60 @@ watch(syncProvider, (nextProvider) => {
   </main>
 </template>
 
-
 <style scoped>
+:global(html),
+:global(body),
+:global(#app) {
+  background: #faf8f5;
+  color: #1a1816;
+}
+
+:global(body) {
+  --bg: #faf8f5;
+  --bg-glass: rgba(255, 255, 255, 0.7);
+  --ink: #1a1816;
+  --ink-soft: #5c5650;
+  --ink-muted: #9a918a;
+  --card: rgba(255, 255, 255, 0.85);
+  --card-border: rgba(0, 0, 0, 0.06);
+  --input-bg: rgba(255, 255, 255, 0.9);
+  --input-border: rgba(0, 0, 0, 0.08);
+  --accent: #e85d3b;
+  --accent-soft: rgba(232, 93, 59, 0.12);
+  --success: #22a55b;
+  --success-soft: rgba(34, 165, 91, 0.12);
+  --danger: #dc3545;
+  --danger-soft: rgba(220, 53, 69, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :global(html),
+  :global(body),
+  :global(#app) {
+    background: #0f0f0f;
+    color: #f5f3f0;
+    color-scheme: dark;
+  }
+
+  :global(body) {
+    --bg: #0f0f0f;
+    --bg-glass: rgba(40, 40, 40, 0.9);
+    --ink: #f5f3f0;
+    --ink-soft: #d4cfc8;
+    --ink-muted: #a09890;
+    --card: rgba(32, 30, 28, 0.95);
+    --card-border: rgba(255, 255, 255, 0.08);
+    --input-bg: rgba(255, 255, 255, 0.06);
+    --input-border: rgba(255, 255, 255, 0.12);
+    --accent: #ff7a5c;
+    --accent-soft: rgba(255, 122, 92, 0.18);
+    --success: #4ade80;
+    --success-soft: rgba(74, 222, 128, 0.18);
+    --danger: #f87171;
+    --danger-soft: rgba(248, 113, 113, 0.18);
+  }
+}
+
 .panel {
   --bg: #faf8f5;
   --bg-glass: rgba(255, 255, 255, 0.7);
@@ -1189,6 +1516,7 @@ watch(syncProvider, (nextProvider) => {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  overflow: visible;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -1311,6 +1639,7 @@ watch(syncProvider, (nextProvider) => {
   flex-direction: column;
   gap: 10px;
   animation: slideUp 0.3s ease-out backwards;
+  overflow: visible;
 }
 
 .card:nth-child(2) { animation-delay: 0.05s; }
@@ -1374,6 +1703,7 @@ watch(syncProvider, (nextProvider) => {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  overflow: visible;
 }
 
 .version-list {
@@ -1475,6 +1805,62 @@ watch(syncProvider, (nextProvider) => {
   }
 }
 
+.sync-log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sync-log-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--card-border);
+  background: var(--bg-glass);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
+}
+
+.sync-log-item[data-status="ok"] .sync-log-title {
+  color: var(--success);
+}
+
+.sync-log-item[data-status="error"] {
+  border-color: rgba(220, 53, 69, 0.4);
+  background: linear-gradient(140deg, rgba(220, 53, 69, 0.12), rgba(255, 255, 255, 0.02));
+}
+
+.sync-log-item[data-status="error"] .sync-log-title {
+  color: var(--danger);
+}
+
+.sync-log-main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.sync-log-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.sync-log-summary {
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
+.sync-log-time {
+  font-size: 11px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+  padding-top: 2px;
+}
+
 .btn--rollback {
   background: linear-gradient(135deg, #ff8866 0%, #ff6f45 100%);
   color: #fff;
@@ -1504,6 +1890,7 @@ watch(syncProvider, (nextProvider) => {
   display: flex;
   flex-direction: column;
   gap: 5px;
+  overflow: visible;
 }
 
 .field__label {
@@ -1538,6 +1925,116 @@ select.input {
   background-size: 5px 5px, 5px 5px;
   background-repeat: no-repeat;
   padding-right: 26px;
+  background-color: var(--card);
+  border-color: var(--card-border);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 6px 18px rgba(0, 0, 0, 0.15);
+  cursor: pointer;
+  color-scheme: light;
+}
+
+select.input option,
+select.input optgroup {
+  background: var(--card);
+  color: var(--ink);
+  padding: 6px 10px;
+}
+
+@media (prefers-color-scheme: dark) {
+  select.input {
+    color-scheme: dark;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03), 0 8px 24px rgba(0, 0, 0, 0.45);
+  }
+}
+
+.select-input {
+  position: relative;
+}
+
+.select-input__trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  cursor: pointer;
+}
+
+.select-input__value {
+  font-weight: 600;
+}
+
+.select-input__arrow {
+  font-size: 14px;
+  color: var(--ink-muted);
+  transition: transform 0.15s ease;
+}
+
+.select-input.is-open .select-input__arrow {
+  transform: rotate(180deg);
+}
+
+.select-menu {
+  position: fixed;
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02)), var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  box-shadow:
+    0 20px 60px rgba(0, 0, 0, 0.32),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  padding: 6px;
+  z-index: 999999;
+  backdrop-filter: blur(12px);
+  max-height: 260px;
+  overflow: auto;
+}
+
+@media (prefers-color-scheme: dark) {
+  .select-menu {
+    background: linear-gradient(160deg, rgba(255, 122, 92, 0.08), rgba(255, 255, 255, 0.01)), var(--card);
+  }
+}
+
+.select-option {
+  width: 100%;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink);
+  padding: 10px 12px;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease, transform 0.1s ease;
+}
+
+.select-option:hover {
+  background: var(--accent-soft);
+}
+
+.select-option.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  box-shadow: 0 4px 12px rgba(232, 93, 59, 0.18);
+}
+
+.select-option__check {
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
 }
 
 .input::placeholder {
