@@ -11,6 +11,7 @@ import {
   githubTokenReady,
   lastValidationTime,
   syncFolderSelection,
+  syncFolderSelectionReady,
   syncProvider,
   syncProviderReady,
   webdavConnectionStatus,
@@ -397,25 +398,41 @@ async function syncNow() {
   }
 }
 
-async function downloadBookmarks() {
+async function downloadBookmarks(options?: { silent?: boolean }) {
   downloadState.value = 'syncing'
 
   try {
     const result = await sendMessage('sync-download', undefined, 'background')
     if (result.ok) {
       downloadState.value = 'done'
-      showToast(result.summary || '拉取成功', 'success')
+      if (!options?.silent)
+        showToast(result.summary || '拉取成功', 'success')
       void loadFolderTree()
       return
     }
 
     downloadState.value = 'error'
-    showToast(result.error || '拉取失败', 'error')
+    if (!options?.silent)
+      showToast(result.error || '拉取失败', 'error')
   }
   catch (error) {
     downloadState.value = 'error'
-    showToast(error instanceof Error ? error.message : '拉取失败', 'error')
+    if (!options?.silent)
+      showToast(error instanceof Error ? error.message : '拉取失败', 'error')
   }
+}
+
+async function autoPullOnOpen() {
+  if (syncProvider.value === 'webdav') {
+    if (!webdavUrl.value?.trim())
+      return
+  }
+  else {
+    if (!githubToken.value?.trim() || !gistId.value?.trim() || !gistFileName.value?.trim())
+      return
+  }
+
+  await downloadBookmarks({ silent: true })
 }
 
 function handleDownloadClick() {
@@ -789,6 +806,10 @@ onMounted(() => {
   syncProviderReady.then(() => {
     if (syncProvider.value !== 'gist' && syncProvider.value !== 'webdav')
       syncProvider.value = 'gist'
+  })
+
+  Promise.all([syncProviderReady, githubTokenReady, gistIdReady, webdavUrlReady, syncFolderSelectionReady]).then(() => {
+    void autoPullOnOpen()
   })
 })
 

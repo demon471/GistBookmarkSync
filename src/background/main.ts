@@ -881,7 +881,7 @@ function scheduleAutoUpload() {
   autoSyncTimer = setTimeout(() => {
     autoSyncTimer = null
     void runAutoUpload()
-  }, 800)
+  }, 2000)
 }
 
 async function buildLocalIndex(root: browser.bookmarks.BookmarkTreeNode) {
@@ -1626,7 +1626,6 @@ onMessage('webdav-download-version', async ({ data }) => {
     'webdav-url',
     'webdav-username',
     'webdav-password',
-    'sync-folder-selection',
   ])
   const baseUrl = (stored['webdav-url'] as string | undefined)?.trim()
   const username = (stored['webdav-username'] as string | undefined) || ''
@@ -1635,9 +1634,9 @@ onMessage('webdav-download-version', async ({ data }) => {
   if (!baseUrl)
     return { ok: false, error: '请先配置 WebDAV 地址' }
 
-  const selectedFolderIds = parseSelectedFolderIds(stored['sync-folder-selection'])
+  const selectedFolderIds: string[] = []
 
-  const localResult = await loadLocalNodes(selectedFolderIds)
+  const localResult = await loadLocalNodes(undefined)
   if (!localResult.ok)
     return { ok: false, error: localResult.error }
 
@@ -1660,10 +1659,10 @@ onMessage('webdav-download-version', async ({ data }) => {
   bookmarkEventSuspension += 1
   try {
     await clearLocalBookmarks(localResult.root, new Set(selectedFolderIds))
-    const refreshedLocal = await loadLocalNodes(selectedFolderIds)
+    const refreshedLocal = await loadLocalNodes(undefined)
     if (!refreshedLocal.ok)
       return { ok: false, error: refreshedLocal.error }
-    return await applyWebDavDownload(webdavResult.nodes, refreshedLocal.root, refreshedLocal.localNodes, selectedFolderIds)
+    return await applyWebDavDownload(webdavResult.nodes, refreshedLocal.root, refreshedLocal.localNodes, undefined)
   }
   finally {
     bookmarkEventSuspension = Math.max(0, bookmarkEventSuspension - 1)
