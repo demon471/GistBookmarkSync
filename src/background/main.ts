@@ -51,6 +51,10 @@ type GistLoadResult =
   | { ok: true, gistNodes: SyncNode[], raw: { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] } }
   | { ok: false, error: string }
 
+type WebDavLoadResult =
+  | { ok: true, nodes: SyncNode[], raw: { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] } }
+  | { ok: false, error: string }
+
 function normalizeTitle(title?: string) {
   return (title || '').trim()
 }
@@ -243,6 +247,149 @@ function buildBookmarkPayload(nodes: SyncNode[]) {
   }
 }
 
+function buildWebDavFileUrl(baseUrl: string, filePath?: string) {
+  const normalizedBase = baseUrl.trim()
+  const normalizedPath = (filePath || '').trim()
+  if (!normalizedPath)
+    return normalizedBase
+  if (normalizedBase.endsWith('/') && normalizedPath.startsWith('/'))
+    return `${normalizedBase}${normalizedPath.slice(1)}`
+  if (!normalizedBase.endsWith('/') && !normalizedPath.startsWith('/'))
+    return `${normalizedBase}/${normalizedPath}`
+  return `${normalizedBase}${normalizedPath}`
+}
+
+function resolveWebDavFilePath(filePath?: string) {
+  const normalized = (filePath || '').trim()
+  return normalized || 'gist-bookmark-sync/bookmarks.json'
+}
+
+function buildWebDavAuthHeaders(username?: string, password?: string) {
+  if (!username && !password)
+    return {}
+  const token = btoa(`${username || ''}:${password || ''}`)
+  return {
+    Authorization: `Basic ${token}`,
+  }
+}
+
+function getWebDavDirectorySegments(filePath: string) {
+  const normalized = filePath.replace(/^\/+/, '').replace(/\/+$/, '')
+  const parts = normalized.split('/').filter(Boolean)
+  if (parts.length <= 1)
+    return []
+  return parts.slice(0, -1)
+}
+
+async function probeWebDavPath(url: string, username?: string, password?: string) {
+  const response = await fetch(url, {
+    method: 'PROPFIND',
+    headers: {
+      Depth: '0',
+      ...buildWebDavAuthHeaders(username, password),
+    },
+  })
+  return response
+}
+
+async function ensureWebDavDirectory(url: string, username?: string, password?: string) {
+  let response = await probeWebDavPath(url, username, password)
+
+  if (response.status === 401 || response.status === 403)
+    return { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' }
+
+  if (response.status === 404) {
+    response = await fetch(url, {
+      method: 'MKCOL',
+      headers: {
+        ...buildWebDavAuthHeaders(username, password),
+      },
+    })
+
+    if (response.status === 401 || response.status === 403)
+      return { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' }
+
+    if (!response.ok && response.status !== 405)
+      return { ok: false, error: 'WebDAV 目录创建失败，请检查权限' }
+
+    return { ok: true }
+  }
+
+  if (!response.ok && response.status !== 207)
+    return { ok: false, error: 'WebDAV 目录校验失败，请检查地址配置' }
+
+  return { ok: true }
+}
+
+async function ensureWebDavDirectories(baseUrl: string, filePath: string, username?: string, password?: string) {
+  const segments = getWebDavDirectorySegments(filePath)
+  if (segments.length === 0)
+    return { ok: true }
+
+  let currentPath = ''
+  for (const segment of segments) {
+    currentPath = currentPath ? `${currentPath}/${segment}` : segment
+    const dirUrl = buildWebDavFileUrl(baseUrl, `${currentPath}/`)
+    const result = await ensureWebDavDirectory(dirUrl, username, password)
+    if (!result.ok)
+      return result
+  }
+
+  return { ok: true }
+}
+
+async function loadWebDavBookmarks(url: string, username?: string, password?: string): Promise<WebDavLoadResult> {
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      ...buildWebDavAuthHeaders(username, password),
+    },
+  })
+
+  if (response.status === 401 || response.status === 403)
+    return { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' }
+  if (response.status === 404)
+    return { ok: false, error: 'WebDAV 文件不存在，请先推送一次' }
+  if (!response.ok)
+    return { ok: false, error: 'WebDAV 拉取失败，请检查地址配置' }
+
+  const content = await response.text()
+  let parsed: { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
+  try {
+    parsed = JSON.parse(content) as { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
+  }
+  catch {
+    return { ok: false, error: 'WebDAV 文件不是有效的 JSON' }
+  }
+
+  if (!Array.isArray(parsed.bookmarks))
+    return { ok: false, error: 'WebDAV 文件缺少 bookmarks 数组' }
+
+  const nodes = sanitizeNodes(parsed.bookmarks)
+  return { ok: true, nodes, raw: parsed }
+}
+
+async function updateWebDavFile(url: string, username: string | undefined, password: string | undefined, nodes: SyncNode[]) {
+  const payload = buildBookmarkPayload(nodes)
+  const response = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      ...buildWebDavAuthHeaders(username, password),
+    },
+    body: `${JSON.stringify(payload)}\n`,
+  })
+
+  if (response.status === 401 || response.status === 403)
+    return { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' }
+  if (response.status === 404)
+    return { ok: false, error: 'WebDAV 路径不存在，请检查目录' }
+  if (!response.ok)
+    return { ok: false, error: 'WebDAV 推送失败，请检查地址配置' }
+
+  return { ok: true }
+}
+
 async function updateGistFile(token: string, gistId: string, fileName: string, nodes: SyncNode[]) {
   const payload = buildBookmarkPayload(nodes)
   const updateResponse = await fetch(`https://api.github.com/gists/${gistId}`, {
@@ -255,7 +402,7 @@ async function updateGistFile(token: string, gistId: string, fileName: string, n
     body: JSON.stringify({
       files: {
         [fileName]: {
-          content: `${JSON.stringify(payload, null, 2)}\n`,
+          content: `${JSON.stringify(payload)}\n`,
         },
       },
     }),
@@ -455,7 +602,7 @@ onMessage('validate-gist-auth', async ({ data }) => {
         public: false,
         files: {
           [fileName]: {
-            content: `${JSON.stringify(buildBookmarkPayload([]), null, 2)}\n`,
+            content: `${JSON.stringify(buildBookmarkPayload([]))}\n`,
           },
         },
       }),
@@ -522,7 +669,7 @@ onMessage('validate-gist-auth', async ({ data }) => {
       body: JSON.stringify({
         files: {
           [fileName]: {
-            content: `${JSON.stringify(buildBookmarkPayload([]), null, 2)}\n`,
+            content: `${JSON.stringify(buildBookmarkPayload([]))}\n`,
           },
         },
       }),
@@ -560,6 +707,53 @@ onMessage('validate-gist-auth', async ({ data }) => {
   }
 })
 
+onMessage('validate-webdav-auth', async ({ data }) => {
+  const baseUrl = data?.url?.trim()
+  const rawFilePath = ''
+  const username = data?.username as string | undefined
+  const password = data?.password as string | undefined
+  const errors: string[] = []
+
+  if (!baseUrl)
+    errors.push('WebDAV 地址不能为空')
+
+  if (errors.length > 0)
+    return { ok: false, errors }
+
+  const filePath = resolveWebDavFilePath(rawFilePath)
+
+  if (filePath) {
+    const ensureResult = await ensureWebDavDirectories(baseUrl, filePath, username, password)
+    if (!ensureResult.ok)
+      return { ok: false, errors: [ensureResult.error || 'WebDAV 目录校验失败'] }
+  }
+
+  const fileUrl = buildWebDavFileUrl(baseUrl, filePath)
+
+  try {
+    const response = await fetch(fileUrl, {
+      method: 'GET',
+      headers: {
+        ...buildWebDavAuthHeaders(username, password),
+      },
+    })
+
+    if (response.status === 401 || response.status === 403)
+      return { ok: false, errors: ['WebDAV 认证失败，请检查账号或密码'] }
+
+    if (response.status === 404)
+      return { ok: true, missing: true }
+
+    if (!response.ok)
+      return { ok: false, errors: ['WebDAV 连接失败，请检查地址配置'] }
+
+    return { ok: true, missing: false }
+  }
+  catch {
+    return { ok: false, errors: ['WebDAV 连接失败，请检查地址配置'] }
+  }
+})
+
 onMessage('get-bookmark-folders', async () => {
   const tree = await browser.bookmarks.getTree()
   const root = tree[0]
@@ -581,13 +775,18 @@ onMessage('get-bookmark-folders', async () => {
 
 async function performSync(mode: 'upload' | 'download') {
   const stored = await browser.storage.local.get([
+    'sync-provider',
     'github-token',
     'gist-id',
     'gist-file-name',
     'sync-direction',
     'sync-conflict-strategy',
     'sync-folder-selection',
+    'webdav-url',
+    'webdav-username',
+    'webdav-password',
   ])
+  const provider = (stored['sync-provider'] as string | undefined) || 'gist'
   const token = (stored['github-token'] as string | undefined)?.trim()
   const gistId = (stored['gist-id'] as string | undefined)?.trim()
   const fileName = (stored['gist-file-name'] as string | undefined)?.trim()
@@ -611,6 +810,107 @@ async function performSync(mode: 'upload' | 'download') {
 
   // eslint-disable-next-line no-console
   console.log('[GistSync] selectedFolderIds from storage:', selectedFolderIds)
+
+  if (provider === 'webdav') {
+    const baseUrl = (stored['webdav-url'] as string | undefined)?.trim()
+    const username = (stored['webdav-username'] as string | undefined) || ''
+    const password = (stored['webdav-password'] as string | undefined) || ''
+
+    if (!baseUrl) {
+      await browser.storage.local.set({
+        'webdav-connection-status': 'error',
+        'webdav-last-validation-time': Date.now(),
+      })
+      return {
+        ok: false,
+        error: '请先配置 WebDAV 地址',
+      }
+    }
+
+    const filePath = resolveWebDavFilePath('')
+    const fileUrl = buildWebDavFileUrl(baseUrl, filePath)
+
+    const localResult = await loadLocalNodes(selectedFolderIds)
+    if (!localResult.ok)
+      return { ok: false, error: localResult.error }
+
+    const { root, localNodes } = localResult
+
+    if (mode === 'upload') {
+      const ensureResult = await ensureWebDavDirectories(baseUrl, filePath, username, password)
+      if (!ensureResult.ok) {
+        await browser.storage.local.set({
+          'webdav-connection-status': 'error',
+          'webdav-last-validation-time': Date.now(),
+        })
+        return { ok: false, error: ensureResult.error }
+      }
+
+      const updated = await updateWebDavFile(fileUrl, username, password, localNodes)
+      if (!updated.ok) {
+        await browser.storage.local.set({
+          'webdav-connection-status': 'error',
+          'webdav-last-validation-time': Date.now(),
+        })
+        return { ok: false, error: updated.error }
+      }
+
+      const localCount = countBookmarks(localNodes)
+      const summary = `推送成功 ${localCount} 条书签`
+      const timestamp = new Date().toISOString()
+
+      await browser.storage.local.set({
+        'webdav-connection-status': 'ok',
+        'webdav-last-validation-time': Date.now(),
+        'webdav-last-sync': timestamp,
+        'webdav-last-sync-summary': summary,
+        'webdav-last-sync-folders': selectedFolderIds || [],
+      })
+
+      return {
+        ok: true,
+        summary,
+        timestamp,
+      }
+    }
+
+    const webdavResult = await loadWebDavBookmarks(fileUrl, username, password)
+    if (!webdavResult.ok) {
+      await browser.storage.local.set({
+        'webdav-connection-status': 'error',
+        'webdav-last-validation-time': Date.now(),
+      })
+      return { ok: false, error: webdavResult.error }
+    }
+
+    await browser.storage.local.set({
+      'webdav-connection-status': 'ok',
+      'webdav-last-validation-time': Date.now(),
+    })
+
+    const mergedNodes = mergeNodeLists(localNodes, webdavResult.nodes)
+
+    const index = await buildLocalIndex(root)
+    await ensureLocalEntries(root.id, index, mergedNodes)
+
+    const webdavCount = countBookmarks(webdavResult.nodes)
+    const localCount = countBookmarks(localNodes)
+    const mergedCount = countBookmarks(mergedNodes)
+    const summary = `拉取成功 ${mergedCount} 条书签 (云端 ${webdavCount}, 本地 ${localCount})`
+    const timestamp = new Date().toISOString()
+
+    await browser.storage.local.set({
+      'webdav-last-sync': timestamp,
+      'webdav-last-sync-summary': summary,
+      'webdav-last-sync-folders': selectedFolderIds || [],
+    })
+
+    return {
+      ok: true,
+      summary,
+      timestamp,
+    }
+  }
 
   if (!token || !gistId || !fileName) {
     // 更新连接状态为错误

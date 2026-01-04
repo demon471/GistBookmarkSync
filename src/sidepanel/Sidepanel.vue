@@ -1,7 +1,26 @@
 <script setup lang="ts">
 import { sendMessage } from 'webext-bridge/popup'
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { connectionStatus, connectionStatusReady, gistFileName, gistId, gistIdReady, githubToken, githubTokenReady, lastValidationTime, syncFolderSelection } from '~/logic/storage'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import {
+  connectionStatus,
+  connectionStatusReady,
+  gistFileName,
+  gistId,
+  gistIdReady,
+  githubToken,
+  githubTokenReady,
+  lastValidationTime,
+  syncFolderSelection,
+  syncProvider,
+  syncProviderReady,
+  webdavConnectionStatus,
+  webdavConnectionStatusReady,
+  webdavLastValidationTime,
+  webdavPassword,
+  webdavUrl,
+  webdavUrlReady,
+  webdavUsername,
+} from '~/logic/storage'
 
 type FolderNode = {
   id: string
@@ -10,7 +29,8 @@ type FolderNode = {
   children: FolderNode[]
 }
 
-const validationState = ref<'idle' | 'checking' | 'ok' | 'error'>('idle')
+const gistValidationState = ref<'idle' | 'checking' | 'ok' | 'error'>('idle')
+const webdavValidationState = ref<'idle' | 'checking' | 'ok' | 'error'>('idle')
 const uploadState = ref<'idle' | 'syncing' | 'done' | 'error'>('idle')
 const downloadState = ref<'idle' | 'syncing' | 'done' | 'error'>('idle')
 const folderTree = ref<FolderNode[]>([])
@@ -19,6 +39,18 @@ const folderTreeMessage = ref('')
 const selectedFolderIds = ref(new Set<string>())
 const savedFolderIds = ref(new Set<string>()) // 已保存的选择，用于统计
 const currentTabId = ref<number | null>(null)
+
+const activeValidationState = computed(() => {
+  return syncProvider.value === 'webdav' ? webdavValidationState.value : gistValidationState.value
+})
+
+const providerTitle = computed(() => {
+  return syncProvider.value === 'webdav' ? 'WebDAV Sync' : 'Gist Sync'
+})
+
+const providerSubtitle = computed(() => {
+  return syncProvider.value === 'webdav' ? '书签 WebDAV 同步' : '书签云同步'
+})
 
 async function resolveTabId() {
   if (currentTabId.value !== null) return
@@ -136,7 +168,7 @@ const RANDOM_CHECK_RATE = 0.1
 // 静默验证连接（不显示 toast，用于自动验证）
 async function checkConnection(force = false) {
   if (!githubToken.value?.trim() || !gistId.value?.trim()) {
-    validationState.value = 'idle'
+    gistValidationState.value = 'idle'
     connectionStatus.value = ''
     return
   }
@@ -151,7 +183,7 @@ async function checkConnection(force = false) {
     if (connectionStatus.value === 'ok') {
       // 在有效期内，直接使用缓存状态
       if (timeSinceLastCheck < VALIDATION_INTERVAL) {
-        validationState.value = 'ok'
+        gistValidationState.value = 'ok'
         // 随机校验（10%概率）
         if (Math.random() >= RANDOM_CHECK_RATE) {
           return
@@ -160,12 +192,12 @@ async function checkConnection(force = false) {
     }
     // 如果之前验证失败，短时间内不重复验证（1分钟）
     else if (connectionStatus.value === 'error' && timeSinceLastCheck < 60 * 1000) {
-      validationState.value = 'error'
+      gistValidationState.value = 'error'
       return
     }
   }
 
-  validationState.value = 'checking'
+  gistValidationState.value = 'checking'
 
   try {
     const result = await sendMessage(
@@ -181,19 +213,19 @@ async function checkConnection(force = false) {
     )
 
     const status = result.ok ? 'ok' : 'error'
-    validationState.value = status
+    gistValidationState.value = status
     connectionStatus.value = status
     lastValidationTime.value = Date.now()
   }
   catch {
-    validationState.value = 'error'
+    gistValidationState.value = 'error'
     connectionStatus.value = 'error'
     lastValidationTime.value = Date.now()
   }
 }
 
 async function validateGistAuth() {
-  validationState.value = 'checking'
+  gistValidationState.value = 'checking'
 
   // 设置默认文件名
   if (!gistFileName.value.trim()) {
@@ -214,7 +246,7 @@ async function validateGistAuth() {
     )
 
     if (result.ok) {
-      validationState.value = 'ok'
+      gistValidationState.value = 'ok'
       connectionStatus.value = 'ok'
       lastValidationTime.value = Date.now()
       if (result.gist?.id)
@@ -228,15 +260,109 @@ async function validateGistAuth() {
       return
     }
 
-    validationState.value = 'error'
+    gistValidationState.value = 'error'
     connectionStatus.value = 'error'
     lastValidationTime.value = Date.now()
     showToast(result.errors?.join('; ') || '保存失败', 'error')
   }
   catch (error) {
-    validationState.value = 'error'
+    gistValidationState.value = 'error'
     connectionStatus.value = 'error'
     lastValidationTime.value = Date.now()
+    showToast(error instanceof Error ? error.message : '保存失败', 'error')
+  }
+}
+
+// WebDAV 验证
+const WEBDAV_VALIDATION_INTERVAL = 60 * 60 * 1000
+const WEBDAV_RANDOM_CHECK_RATE = 0.1
+
+async function checkWebdavConnection(force = false) {
+  if (!webdavUrl.value?.trim()) {
+    webdavValidationState.value = 'idle'
+    webdavConnectionStatus.value = ''
+    return
+  }
+
+  const now = Date.now()
+  const lastTime = webdavLastValidationTime.value || 0
+  const timeSinceLastCheck = now - lastTime
+
+  if (!force) {
+    if (webdavConnectionStatus.value === 'ok') {
+      if (timeSinceLastCheck < WEBDAV_VALIDATION_INTERVAL) {
+        webdavValidationState.value = 'ok'
+        if (Math.random() >= WEBDAV_RANDOM_CHECK_RATE)
+          return
+      }
+    }
+    else if (webdavConnectionStatus.value === 'error' && timeSinceLastCheck < 60 * 1000) {
+      webdavValidationState.value = 'error'
+      return
+    }
+  }
+
+  webdavValidationState.value = 'checking'
+
+  try {
+    const result = await sendMessage(
+      'validate-webdav-auth',
+      {
+        url: webdavUrl.value,
+        username: webdavUsername.value,
+        password: webdavPassword.value,
+      },
+      'background',
+    )
+
+    const status = result.ok ? 'ok' : 'error'
+    webdavValidationState.value = status
+    webdavConnectionStatus.value = status
+    webdavLastValidationTime.value = Date.now()
+  }
+  catch {
+    webdavValidationState.value = 'error'
+    webdavConnectionStatus.value = 'error'
+    webdavLastValidationTime.value = Date.now()
+  }
+}
+
+async function validateWebdavAuth() {
+  webdavValidationState.value = 'checking'
+
+  // 留空时由后台自动生成默认路径
+
+  try {
+    const result = await sendMessage(
+      'validate-webdav-auth',
+      {
+        url: webdavUrl.value,
+        username: webdavUsername.value,
+        password: webdavPassword.value,
+      },
+      'background',
+    )
+
+    if (result.ok) {
+      webdavValidationState.value = 'ok'
+      webdavConnectionStatus.value = 'ok'
+      webdavLastValidationTime.value = Date.now()
+      if (result.missing)
+        showToast('连接成功，文件不存在，将在首次同步时创建', 'success')
+      else
+        showToast('配置已保存', 'success')
+      return
+    }
+
+    webdavValidationState.value = 'error'
+    webdavConnectionStatus.value = 'error'
+    webdavLastValidationTime.value = Date.now()
+    showToast(result.errors?.join('; ') || '保存失败', 'error')
+  }
+  catch (error) {
+    webdavValidationState.value = 'error'
+    webdavConnectionStatus.value = 'error'
+    webdavLastValidationTime.value = Date.now()
     showToast(error instanceof Error ? error.message : '保存失败', 'error')
   }
 }
@@ -284,16 +410,20 @@ async function downloadBookmarks() {
 
 function exportConfig() {
   const config = {
+    syncProvider: syncProvider.value,
     githubToken: githubToken.value,
     gistId: gistId.value,
     gistFileName: gistFileName.value,
+    webdavUrl: webdavUrl.value,
+    webdavUsername: webdavUsername.value,
+    webdavPassword: webdavPassword.value,
     syncFolderSelection: Array.from(selectedFolderIds.value),
   }
   const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = 'gist-sync-config.json'
+  a.download = 'bookmark-sync-config.json'
   a.click()
   URL.revokeObjectURL(url)
   showToast('配置已导出', 'success')
@@ -309,9 +439,14 @@ function importConfig() {
     try {
       const text = await file.text()
       const config = JSON.parse(text)
+      if (config.syncProvider === 'webdav' || config.syncProvider === 'gist')
+        syncProvider.value = config.syncProvider
       if (config.githubToken) githubToken.value = config.githubToken
       if (config.gistId) gistId.value = config.gistId
       if (config.gistFileName) gistFileName.value = config.gistFileName
+      if (config.webdavUrl) webdavUrl.value = config.webdavUrl
+      if (config.webdavUsername) webdavUsername.value = config.webdavUsername
+      if (config.webdavPassword) webdavPassword.value = config.webdavPassword
       if (Array.isArray(config.syncFolderSelection)) {
         syncFolderSelection.value = config.syncFolderSelection
         selectedFolderIds.value = new Set(config.syncFolderSelection)
@@ -469,16 +604,44 @@ onMounted(() => {
   Promise.all([githubTokenReady, gistIdReady, connectionStatusReady]).then(() => {
     // 恢复之前保存的连接状态
     if (connectionStatus.value === 'ok') {
-      validationState.value = 'ok'
+      gistValidationState.value = 'ok'
     }
     else if (connectionStatus.value === 'error') {
-      validationState.value = 'error'
+      gistValidationState.value = 'error'
     }
     // 如果有配置但没有连接状态，进行一次验证
     else if (githubToken.value?.trim() && gistId.value?.trim()) {
       void checkConnection()
     }
   })
+
+  Promise.all([webdavConnectionStatusReady, webdavUrlReady]).then(() => {
+    if (webdavConnectionStatus.value === 'ok') {
+      webdavValidationState.value = 'ok'
+    }
+    else if (webdavConnectionStatus.value === 'error') {
+      webdavValidationState.value = 'error'
+    }
+    else if (webdavUrl.value?.trim()) {
+      void checkWebdavConnection()
+    }
+  })
+
+  syncProviderReady.then(() => {
+    if (syncProvider.value !== 'gist' && syncProvider.value !== 'webdav')
+      syncProvider.value = 'gist'
+  })
+})
+
+watch(syncProvider, (nextProvider) => {
+  if (nextProvider === 'webdav') {
+    if (webdavConnectionStatus.value === '' && webdavUrl.value?.trim())
+      void checkWebdavConnection()
+  }
+  else {
+    if (connectionStatus.value === '' && githubToken.value?.trim() && gistId.value?.trim())
+      void checkConnection()
+  }
 })
 </script>
 
@@ -490,15 +653,15 @@ onMounted(() => {
           <ph-cloud-arrow-up class="panel__logo-icon" />
         </div>
         <div>
-          <h1 class="panel__title">Gist Sync</h1>
-          <p class="panel__subtitle">书签云同步</p>
+          <h1 class="panel__title">{{ providerTitle }}</h1>
+          <p class="panel__subtitle">{{ providerSubtitle }}</p>
         </div>
       </div>
-      <div class="panel__status" :data-state="validationState">
+      <div class="panel__status" :data-state="activeValidationState">
         <span class="panel__status-dot" />
-        <span v-if="validationState === 'checking'">校验中</span>
-        <span v-else-if="validationState === 'ok'">已连接</span>
-        <span v-else-if="validationState === 'error'">连接失败</span>
+        <span v-if="activeValidationState === 'checking'">校验中</span>
+        <span v-else-if="activeValidationState === 'ok'">已连接</span>
+        <span v-else-if="activeValidationState === 'error'">连接失败</span>
         <span v-else>未连接</span>
       </div>
     </header>
@@ -526,32 +689,80 @@ onMounted(() => {
         <ph-plugs-connected class="card__icon" />
         <h2 class="card__title">连接配置</h2>
       </div>
-      <div class="field">
-        <label class="field__label">
-          <ph-key class="field__icon" />
-          GitHub Token
-        </label>
-        <input v-model="githubToken" type="password" placeholder="ghp_xxxxxxxxxxxx" class="input">
+      <div class="provider-tabs">
+        <button
+          class="provider-tab"
+          :class="{ 'is-active': syncProvider === 'gist' }"
+          @click="syncProvider = 'gist'"
+        >
+          Gist
+        </button>
+        <button
+          class="provider-tab"
+          :class="{ 'is-active': syncProvider === 'webdav' }"
+          @click="syncProvider = 'webdav'"
+        >
+          WebDAV
+        </button>
       </div>
-      <div class="field">
-        <label class="field__label">
-          <ph-identification-badge class="field__icon" />
-          Gist ID
-        </label>
-        <input v-model="gistId" placeholder="留空可自动创建" class="input">
+
+      <div v-if="syncProvider === 'gist'" class="provider-form">
+        <div class="field">
+          <label class="field__label">
+            <ph-key class="field__icon" />
+            GitHub Token
+          </label>
+          <input v-model="githubToken" type="password" placeholder="ghp_xxxxxxxxxxxx" class="input">
+        </div>
+        <div class="field">
+          <label class="field__label">
+            <ph-identification-badge class="field__icon" />
+            Gist ID
+          </label>
+          <input v-model="gistId" placeholder="留空可自动创建" class="input">
+        </div>
+        <div class="field">
+          <label class="field__label">
+            <ph-file-text class="field__icon" />
+            文件名
+          </label>
+          <input v-model="gistFileName" placeholder="bookmarks" class="input">
+        </div>
+        <button class="btn btn--primary" :disabled="gistValidationState === 'checking'" @click="validateGistAuth">
+          <ph-floppy-disk v-if="gistValidationState !== 'checking'" class="btn__icon" />
+          <ph-circle-notch v-else class="btn__icon btn__icon--spin" />
+          {{ gistValidationState === 'checking' ? '保存中…' : '保存配置' }}
+        </button>
       </div>
-      <div class="field">
-        <label class="field__label">
-          <ph-file-text class="field__icon" />
-          文件名
-        </label>
-        <input v-model="gistFileName" placeholder="bookmarks" class="input">
+
+      <div v-else class="provider-form">
+        <div class="field">
+          <label class="field__label">
+            <ph-link class="field__icon" />
+            WebDAV 地址
+          </label>
+          <input v-model="webdavUrl" placeholder="https://dav.example.com/remote.php/dav/files/user/" class="input">
+        </div>
+        <div class="field">
+          <label class="field__label">
+            <ph-user class="field__icon" />
+            用户名
+          </label>
+          <input v-model="webdavUsername" placeholder="可选" class="input">
+        </div>
+        <div class="field">
+          <label class="field__label">
+            <ph-key class="field__icon" />
+            密码
+          </label>
+          <input v-model="webdavPassword" type="password" placeholder="可选" class="input">
+        </div>
+        <button class="btn btn--primary" :disabled="webdavValidationState === 'checking'" @click="validateWebdavAuth">
+          <ph-floppy-disk v-if="webdavValidationState !== 'checking'" class="btn__icon" />
+          <ph-circle-notch v-else class="btn__icon btn__icon--spin" />
+          {{ webdavValidationState === 'checking' ? '保存中…' : '保存配置' }}
+        </button>
       </div>
-      <button class="btn btn--primary" :disabled="validationState === 'checking'" @click="validateGistAuth">
-        <ph-floppy-disk v-if="validationState !== 'checking'" class="btn__icon" />
-        <ph-circle-notch v-else class="btn__icon btn__icon--spin" />
-        {{ validationState === 'checking' ? '保存中…' : '保存配置' }}
-      </button>
     </section>
 
     <section class="card">
@@ -568,14 +779,14 @@ onMounted(() => {
           <span class="action-tile__icon"><ph-upload-simple /></span>
           <span class="action-tile__label">导出配置</span>
         </button>
-        <button class="action-tile action-tile--cyan" :disabled="downloadState === 'syncing' || validationState !== 'ok'" @click="downloadBookmarks">
+        <button class="action-tile action-tile--cyan" :disabled="downloadState === 'syncing' || activeValidationState !== 'ok'" @click="downloadBookmarks">
           <span class="action-tile__icon">
             <ph-cloud-arrow-down v-if="downloadState !== 'syncing'" />
             <ph-circle-notch v-else class="btn__icon--spin" />
           </span>
           <span class="action-tile__label">拉取云端</span>
         </button>
-        <button class="action-tile action-tile--purple" :disabled="uploadState === 'syncing' || validationState !== 'ok'" @click="syncNow">
+        <button class="action-tile action-tile--purple" :disabled="uploadState === 'syncing' || activeValidationState !== 'ok'" @click="syncNow">
           <span class="action-tile__icon">
             <ph-cloud-arrow-up v-if="uploadState !== 'syncing'" />
             <ph-circle-notch v-else class="btn__icon--spin" />
@@ -857,6 +1068,40 @@ onMounted(() => {
   font-size: 11px;
   color: var(--ink-muted);
   margin: -2px 0 0;
+}
+
+.provider-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 12px;
+  background: var(--bg-glass);
+  border: 1px solid var(--card-border);
+}
+
+.provider-tab {
+  flex: 1;
+  border: none;
+  padding: 6px 10px;
+  border-radius: 9px;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-muted);
+  cursor: pointer;
+  transition: background 180ms ease, color 180ms ease, box-shadow 180ms ease;
+}
+
+.provider-tab.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.04);
+}
+
+.provider-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 /* Field */

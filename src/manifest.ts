@@ -15,11 +15,6 @@ export async function getManifest() {
     description: pkg.description,
     action: {
       default_icon: 'assets/logo.png',
-      default_popup: 'dist/popup/index.html',
-    },
-    options_ui: {
-      page: 'dist/options/index.html',
-      open_in_tab: true,
     },
     background: isFirefox
       ? {
