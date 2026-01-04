@@ -57,6 +57,9 @@ const intervalDropdownMenuRef = ref<HTMLElement | null>(null)
 const intervalDropdownStyle = ref<Record<string, string>>({})
 const syncLogVisible = ref(false)
 const syncLogReady = ref(false)
+const syncLogError = ref('')
+const exportModalVisible = ref(false)
+const exportIncludeExcluded = ref(true)
 
 const activeValidationState = computed(() => {
   return syncProvider.value === 'webdav' ? webdavValidationState.value : gistValidationState.value
@@ -88,11 +91,24 @@ const syncIntervalLabel = computed(() => {
 const recentSyncLogs = computed(() => {
   if (!Array.isArray(syncLogs.value))
     return []
-  return syncLogs.value.slice(0, 5)
+  return [...syncLogs.value]
+    .sort((a, b) => {
+      const ta = Number(new Date(a.time))
+      const tb = Number(new Date(b.time))
+      return Number.isNaN(tb - ta) ? 0 : tb - ta
+    })
+    .slice(0, 5)
 })
+
+const syncLogCount = computed(() => Array.isArray(syncLogs.value) ? syncLogs.value.length : 0)
 
 function openSyncLog() {
   syncLogVisible.value = true
+}
+
+function clearSyncLogs() {
+  syncLogs.value = []
+  showToast('日志已清空', 'success')
 }
 
 function formatSyncLogTime(time: string) {
@@ -112,6 +128,31 @@ function formatSyncLogTitle(entry: SyncLogEntry) {
   const modeLabel = entry.mode === 'upload' ? '推送' : '拉取'
   const statusLabel = entry.status === 'ok' ? '成功' : '失败'
   return `${providerLabel} · ${modeLabel} · ${statusLabel}`
+}
+
+function formatSyncLogSummary(entry: SyncLogEntry) {
+  if (entry.mode === 'download')
+    return entry.summary.replace(/\s*\(云端.*\)\s*$/, '')
+  return entry.summary
+}
+
+function isPortClosedError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes('back/forward cache')
+    || message.includes('message channel is closed')
+    || message.includes('Could not establish connection')
+    || message.includes('Receiving end does not exist')
+}
+
+async function safeSendMessage(...args: Parameters<typeof sendMessage>) {
+  try {
+    return await sendMessage(...args)
+  }
+  catch (error) {
+    if (!isPortClosedError(error))
+      console.error(error)
+    return { ok: false, error: '消息通道已关闭' }
+  }
 }
 
 function toggleIntervalDropdown() {
@@ -180,6 +221,11 @@ function handleIntervalScroll() {
     void positionIntervalDropdown()
 }
 
+function setScrollLock(locked: boolean) {
+  document.documentElement.style.overflow = locked ? 'hidden' : ''
+  document.body.style.overflow = locked ? 'hidden' : ''
+}
+
 async function resolveTabId() {
   if (currentTabId.value !== null)
     return
@@ -198,14 +244,14 @@ async function notifySidepanelOpen() {
   await resolveTabId()
   if (currentTabId.value === null)
     return
-  void sendMessage('sidepanel-visibility', { open: true, tabId: currentTabId.value }, 'background')
+  void safeSendMessage('sidepanel-visibility', { open: true, tabId: currentTabId.value }, 'background')
 }
 
 async function notifySidepanelClosed() {
   await resolveTabId()
   if (currentTabId.value === null)
     return
-  void sendMessage('sidepanel-visibility', { open: false, tabId: currentTabId.value }, 'background')
+  void safeSendMessage('sidepanel-visibility', { open: false, tabId: currentTabId.value }, 'background')
 }
 
 function handleSidepanelHide() {
@@ -220,9 +266,21 @@ onMounted(() => {
   window.addEventListener('keydown', handleIntervalEsc)
   window.addEventListener('resize', handleIntervalResize)
   window.addEventListener('scroll', handleIntervalScroll, { passive: true })
+  watch(
+    () => exportModalVisible.value || webdavVersionsVisible.value || syncLogVisible.value,
+    locked => setScrollLock(locked),
+    { immediate: true },
+  )
   syncLogsReady.then(() => {
     syncLogReady.value = true
+  }).catch((error) => {
+    syncLogReady.value = true
+    syncLogError.value = error instanceof Error ? error.message : String(error)
+    console.error('[GistSync][Sidepanel] syncLogs load error', error)
   })
+  watch(syncLogs, () => {
+    syncLogReady.value = true
+  }, { immediate: true })
 })
 
 onBeforeUnmount(() => {
@@ -233,6 +291,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleIntervalEsc)
   window.removeEventListener('resize', handleIntervalResize)
   window.removeEventListener('scroll', handleIntervalScroll)
+  setScrollLock(false)
 })
 
 // 检测同步范围是否有未保存的变化
@@ -345,7 +404,7 @@ async function checkConnection(force = false) {
   gistValidationState.value = 'checking'
 
   try {
-    const result = await sendMessage(
+    const result = await safeSendMessage(
       'validate-gist-auth',
       {
         token: githubToken.value,
@@ -383,7 +442,7 @@ async function validateGistAuth() {
   }
 
   try {
-    const result = await sendMessage(
+    const result = await safeSendMessage(
       'validate-gist-auth',
       {
         token: githubToken.value,
@@ -455,7 +514,7 @@ async function checkWebdavConnection(force = false) {
   webdavValidationState.value = 'checking'
 
   try {
-    const result = await sendMessage(
+    const result = await safeSendMessage(
       'validate-webdav-auth',
       {
         url: webdavUrl.value,
@@ -483,7 +542,7 @@ async function validateWebdavAuth() {
   // 留空时由后台自动生成默认路径
 
   try {
-    const result = await sendMessage(
+    const result = await safeSendMessage(
       'validate-webdav-auth',
       {
         url: webdavUrl.value,
@@ -521,7 +580,7 @@ async function syncNow() {
   uploadState.value = 'syncing'
 
   try {
-    const result = await sendMessage('sync-upload', undefined, 'background')
+    const result = await safeSendMessage('sync-upload', undefined, 'background')
     if (result.ok) {
       uploadState.value = 'done'
       showToast(result.summary || '推送成功', 'success')
@@ -541,7 +600,7 @@ async function downloadBookmarks(options?: { silent?: boolean }) {
   downloadState.value = 'syncing'
 
   try {
-    const result = await sendMessage('sync-download', undefined, 'background')
+    const result = await safeSendMessage('sync-download', undefined, 'background')
     if (result.ok) {
       downloadState.value = 'done'
       if (!options?.silent)
@@ -601,7 +660,7 @@ async function loadWebdavVersions() {
   webdavVersionsMessage.value = ''
 
   try {
-    const result = await sendMessage('webdav-list-versions', undefined, 'background') as { ok: boolean, error?: string, versions?: Array<{ file: string, timestamp: string, count?: number }> }
+    const result = await safeSendMessage('webdav-list-versions', undefined, 'background') as { ok: boolean, error?: string, versions?: Array<{ file: string, timestamp: string, count?: number }> }
     if (!result.ok) {
       webdavVersionsState.value = 'error'
       webdavVersionsMessage.value = result.error || '加载版本失败'
@@ -627,7 +686,7 @@ async function downloadWebdavVersion(file: string) {
   downloadState.value = 'syncing'
 
   try {
-    const result = await sendMessage('webdav-download-version', { file }, 'background') as { ok: boolean, error?: string, summary?: string }
+    const result = await safeSendMessage('webdav-download-version', { file }, 'background') as { ok: boolean, error?: string, summary?: string }
     if (result.ok) {
       downloadState.value = 'done'
       showToast(result.summary || '回退成功', 'success')
@@ -646,7 +705,7 @@ async function downloadWebdavVersion(file: string) {
 
 async function deleteWebdavVersion(file: string) {
   try {
-    const result = await sendMessage('webdav-delete-version', { file }, 'background') as { ok: boolean, error?: string }
+    const result = await safeSendMessage('webdav-delete-version', { file }, 'background') as { ok: boolean, error?: string }
     if (!result.ok) {
       showToast(result.error || '删除失败', 'error')
       return
@@ -743,6 +802,9 @@ function importConfig() {
         syncFolderSelection.value = config.syncFolderSelection
         selectedFolderIds.value = new Set(config.syncFolderSelection)
       }
+      if (typeof config.syncIntervalMinutes === 'number') {
+        void safeSendMessage('refresh-sync-interval', { minutes: config.syncIntervalMinutes }, 'background')
+      }
       showToast('配置已导入', 'success')
     }
     catch {
@@ -752,10 +814,6 @@ function importConfig() {
   input.click()
 }
 
-// 书签导出
-const exportModalVisible = ref(false)
-const exportIncludeExcluded = ref(true)
-
 function showExportModal() {
   exportModalVisible.value = true
 }
@@ -763,7 +821,7 @@ function showExportModal() {
 async function doExportBookmarks() {
   exportModalVisible.value = false
   try {
-    const result = await sendMessage('export-bookmarks', { includeExcluded: exportIncludeExcluded.value }, 'background') as { ok: boolean, error?: string, data?: unknown, count?: number }
+    const result = await safeSendMessage('export-bookmarks', { includeExcluded: exportIncludeExcluded.value }, 'background') as { ok: boolean, error?: string, data?: unknown, count?: number }
     if (!result.ok) {
       showToast(result.error || '导出失败', 'error')
       return
@@ -804,7 +862,7 @@ function importBookmarks() {
         return
       }
 
-      const result = await sendMessage('import-bookmarks', { bookmarks }, 'background') as { ok: boolean, error?: string, count?: number }
+      const result = await safeSendMessage('import-bookmarks', { bookmarks }, 'background') as { ok: boolean, error?: string, count?: number }
       if (result.ok) {
         showToast(`已导入 ${result.count} 条书签`, 'success')
         void loadFolderTree()
@@ -860,7 +918,7 @@ async function loadFolderTree() {
   folderTreeMessage.value = ''
 
   try {
-    const result = await sendMessage('get-bookmark-folders', undefined, 'background')
+    const result = await safeSendMessage('get-bookmark-folders', undefined, 'background')
     if (!result.ok) {
       folderTreeState.value = 'error'
       folderTreeMessage.value = result.error || 'Failed to load bookmarks'
@@ -889,7 +947,7 @@ async function saveFolderSelection() {
   const selection = Array.from(selectedFolderIds.value)
   syncFolderSelection.value = selection
   savedFolderIds.value = new Set(selection)
-  await browser.storage.local.set({ 'sync-folder-selection': selection })
+  await browser.storage.local.set({ 'sync-folder-selection': JSON.stringify(selection) })
   void triggerUploadAfterSave()
 }
 
@@ -909,7 +967,7 @@ async function triggerUploadAfterSave() {
 
   try {
     uploadState.value = 'syncing'
-    const result = await sendMessage('sync-upload', undefined, 'background')
+    const result = await safeSendMessage('sync-upload', undefined, 'background')
     if (result.ok) {
       uploadState.value = 'done'
       showToast(result.summary || '同步范围已保存并推送', 'success')
@@ -1073,6 +1131,9 @@ watch(intervalDropdownOpen, (open) => {
           <label class="field__label" @dblclick="openSyncLog">
             <ph-timer class="field__icon" />
             自动拉取间隔
+            <button class="link-ghost" type="button" @click.stop="openSyncLog">
+              查看日志 <span v-if="syncLogCount">({{ syncLogCount }})</span>
+            </button>
           </label>
           <div ref="intervalDropdownRef" class="select-input" :class="{ 'is-open': intervalDropdownOpen }">
             <button
@@ -1145,6 +1206,9 @@ watch(intervalDropdownOpen, (open) => {
           <label class="field__label" @dblclick="openSyncLog">
             <ph-timer class="field__icon" />
             自动拉取间隔
+            <button class="link-ghost" type="button" @click.stop="openSyncLog">
+              查看日志 <span v-if="syncLogCount">({{ syncLogCount }})</span>
+            </button>
           </label>
           <div ref="intervalDropdownRef" class="select-input" :class="{ 'is-open': intervalDropdownOpen }">
             <button
@@ -1405,6 +1469,9 @@ watch(intervalDropdownOpen, (open) => {
               <ph-circle-notch class="tree-loading__icon" />
               <span>加载日志…</span>
             </div>
+            <div v-else-if="syncLogError" class="message" data-state="error">
+              日志加载失败：{{ syncLogError }}
+            </div>
             <div v-else-if="recentSyncLogs.length === 0" class="message" data-state="info">
               暂无同步记录
             </div>
@@ -1415,16 +1482,22 @@ watch(intervalDropdownOpen, (open) => {
                     {{ formatSyncLogTitle(item) }}
                   </div>
                   <div class="sync-log-summary">
-                    {{ item.summary }}
+                    {{ formatSyncLogSummary(item) }}
                   </div>
                 </div>
-                <div class="sync-log-time">
-                  {{ formatSyncLogTime(item.time) }}
+                <div class="sync-log-meta">
+                  <span class="sync-log-badge" :data-mode="item.mode">{{ item.mode === 'upload' ? '推送' : '拉取' }}</span>
+                  <span class="sync-log-time">
+                    {{ formatSyncLogTime(item.time) }}
+                  </span>
                 </div>
               </div>
             </div>
           </div>
           <div class="modal__footer">
+            <button class="btn btn--ghost btn--danger" :disabled="syncLogCount === 0" @click="clearSyncLogs">
+              清空日志
+            </button>
             <button class="btn btn--ghost" @click="syncLogVisible = false">
               关闭
             </button>
@@ -1812,15 +1885,19 @@ watch(intervalDropdownOpen, (open) => {
 }
 
 .sync-log-item {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 12px;
-  border-radius: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  column-gap: 12px;
+  row-gap: 6px;
+  align-items: center;
+  padding: 12px 14px;
+  border-radius: 14px;
   border: 1px solid var(--card-border);
   background: var(--bg-glass);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.02),
+    0 10px 30px rgba(0, 0, 0, 0.18);
 }
 
 .sync-log-item[data-status="ok"] .sync-log-title {
@@ -1837,28 +1914,68 @@ watch(intervalDropdownOpen, (open) => {
 }
 
 .sync-log-main {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-width: 0;
+  display: contents;
 }
 
 .sync-log-title {
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 700;
   color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  grid-column: 1;
+  grid-row: 1;
 }
 
 .sync-log-summary {
   font-size: 11px;
   color: var(--ink-muted);
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.sync-log-meta {
+  display: contents;
+}
+
+.sync-log-badge {
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--card-border);
+  font-size: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  line-height: 1.2;
+  min-width: 40px;
+  text-align: center;
+  justify-self: end;
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.sync-log-badge[data-mode="upload"] {
+  color: var(--success);
+  border-color: rgba(34, 165, 91, 0.4);
+  background: rgba(34, 165, 91, 0.12);
+}
+
+.sync-log-badge[data-mode="download"] {
+  color: var(--accent);
+  border-color: rgba(232, 93, 59, 0.4);
+  background: rgba(232, 93, 59, 0.12);
 }
 
 .sync-log-time {
   font-size: 11px;
   color: var(--ink-muted);
   white-space: nowrap;
-  padding-top: 2px;
+  letter-spacing: 0.01em;
+  padding: 2px 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  justify-self: end;
+  grid-column: 2;
+  grid-row: 2;
 }
 
 .btn--rollback {
@@ -1900,6 +2017,23 @@ watch(intervalDropdownOpen, (open) => {
   font-size: 11px;
   font-weight: 500;
   color: var(--ink-soft);
+}
+
+.link-ghost {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.link-ghost:hover {
+  text-decoration: underline;
 }
 
 .field__icon {
@@ -2171,6 +2305,17 @@ select.input optgroup {
 .btn--ghost:not(:disabled):hover {
   background: var(--accent-soft);
   color: var(--accent);
+  border-color: transparent;
+}
+
+.btn--danger {
+  color: var(--danger);
+  border-color: rgba(220, 53, 69, 0.5);
+}
+
+.btn--danger:not(:disabled):hover {
+  background: var(--danger-soft);
+  color: var(--danger);
   border-color: transparent;
 }
 

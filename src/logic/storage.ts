@@ -11,7 +11,31 @@ export const { data: gistLastSync, dataReady: gistLastSyncReady } = useWebExtens
 export const { data: gistLastSyncSummary, dataReady: gistLastSyncSummaryReady } = useWebExtensionStorage('gist-last-sync-summary', '')
 export const { data: syncDirection, dataReady: syncDirectionReady } = useWebExtensionStorage('sync-direction', 'pull')
 export const { data: syncConflictStrategy, dataReady: syncConflictStrategyReady } = useWebExtensionStorage('sync-conflict-strategy', 'gist-wins')
-export const { data: syncFolderSelection, dataReady: syncFolderSelectionReady } = useWebExtensionStorage<string[]>('sync-folder-selection', [])
+const selectionSerializer = {
+  read(value: unknown) {
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value) as string[]
+        return Array.isArray(parsed) ? parsed : []
+      }
+      catch {
+        return []
+      }
+    }
+    if (Array.isArray(value))
+      return value as string[]
+    return []
+  },
+  write(value: string[]) {
+    return JSON.stringify(value || [])
+  },
+}
+
+export const { data: syncFolderSelection, dataReady: syncFolderSelectionReady } = useWebExtensionStorage<string[]>(
+  'sync-folder-selection',
+  [],
+  { serializer: selectionSerializer },
+)
 export const { data: syncIntervalMinutes, dataReady: syncIntervalMinutesReady } = useWebExtensionStorage<number>('sync-interval-minutes', 0)
 export const { data: syncProvider, dataReady: syncProviderReady } = useWebExtensionStorage<'gist' | 'webdav'>('sync-provider', 'gist')
 
@@ -24,7 +48,31 @@ export interface SyncLogEntry {
   summary: string
 }
 
-export const { data: syncLogs, dataReady: syncLogsReady } = useWebExtensionStorage<SyncLogEntry[]>('sync-log', [])
+const syncLogSerializer = {
+  read(value: unknown) {
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value) as SyncLogEntry[]
+        return Array.isArray(parsed) ? parsed : []
+      }
+      catch {
+        return []
+      }
+    }
+    if (Array.isArray(value))
+      return value as SyncLogEntry[]
+    return []
+  },
+  write(value: SyncLogEntry[]) {
+    return JSON.stringify(value || [])
+  },
+}
+
+export const { data: syncLogs, dataReady: syncLogsReady } = useWebExtensionStorage<SyncLogEntry[]>(
+  'sync-log',
+  [],
+  { serializer: syncLogSerializer },
+)
 
 export const { data: webdavUrl, dataReady: webdavUrlReady } = useWebExtensionStorage('webdav-url', '')
 export const { data: webdavUsername, dataReady: webdavUsernameReady } = useWebExtensionStorage('webdav-username', '')

@@ -20,8 +20,6 @@ if (USE_SIDE_PANEL) {
     .catch((error: unknown) => console.error(error))
 }
 
-void bootstrapSyncIntervalAlarm()
-
 browser.runtime.onInstalled.addListener((): void => {
   // eslint-disable-next-line no-console
   console.log('Extension installed')
@@ -34,6 +32,11 @@ let autoSyncTimer: ReturnType<typeof setTimeout> | null = null
 let autoSyncInProgress = false
 let autoSyncPending = false
 const AUTO_SYNC_ALARM_NAME = 'auto-sync-interval'
+
+function debugLog(...args: unknown[]) {
+  // eslint-disable-next-line no-console
+  console.log('[GistSync]', ...args)
+}
 
 interface SyncNode {
   title: string
@@ -78,13 +81,59 @@ interface SyncLogEntry {
   summary: string
 }
 
-const MAX_SYNC_LOGS = 20
+const MAX_SYNC_LOGS = 5
+const SYNC_LOG_KEY = 'sync-log'
+
+function isPortClosedError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes('back/forward cache')
+    || message.includes('message channel is closed')
+    || message.includes('Could not establish connection')
+    || message.includes('Receiving end does not exist')
+}
+
+async function safeSendMessage(...args: Parameters<typeof sendMessage>) {
+  try {
+    await sendMessage(...args)
+  }
+  catch (error) {
+    if (!isPortClosedError(error))
+      console.error(error)
+  }
+}
+
+function parseSyncLogValue(raw: unknown): SyncLogEntry[] {
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as SyncLogEntry[]
+      return Array.isArray(parsed) ? parsed : []
+    }
+    catch (error) {
+      debugLog('Failed to parse sync log string', error)
+      return []
+    }
+  }
+  if (Array.isArray(raw))
+    return raw as SyncLogEntry[]
+  return []
+}
+
+async function normalizeSyncLogs() {
+  const stored = await browser.storage.local.get([SYNC_LOG_KEY])
+  const existing = parseSyncLogValue(stored[SYNC_LOG_KEY])
+  if (existing.length <= MAX_SYNC_LOGS)
+    return
+  const next = existing.slice(0, MAX_SYNC_LOGS)
+  await browser.storage.local.set({ [SYNC_LOG_KEY]: JSON.stringify(next) })
+  debugLog('Sync log trimmed', next.length)
+}
 
 async function appendSyncLog(entry: SyncLogEntry) {
-  const stored = await browser.storage.local.get(['sync-log'])
-  const existing = Array.isArray(stored['sync-log']) ? stored['sync-log'] as SyncLogEntry[] : []
+  const stored = await browser.storage.local.get([SYNC_LOG_KEY])
+  const existing = parseSyncLogValue(stored[SYNC_LOG_KEY])
   const next = [entry, ...existing].slice(0, MAX_SYNC_LOGS)
-  await browser.storage.local.set({ 'sync-log': next })
+  await browser.storage.local.set({ [SYNC_LOG_KEY]: JSON.stringify(next) })
+  debugLog('Sync log appended', entry)
 }
 
 async function finalizeSyncResult(
@@ -529,10 +578,8 @@ async function applyWebDavDownload(
   const index = await buildLocalIndex(root)
   await ensureLocalEntries(root.id, index, mergedNodes)
 
-  const remoteCount = countBookmarks(remoteNodes)
-  const localCount = countBookmarks(localNodes)
   const mergedCount = countBookmarks(mergedNodes)
-  const summary = `拉取成功 ${mergedCount} 条书签 (云端 ${remoteCount}, 本地 ${localCount})`
+  const summary = `拉取成功 ${mergedCount} 条书签`
   const timestamp = new Date().toISOString()
 
   await browser.storage.local.set({
@@ -836,7 +883,7 @@ async function sendSyncErrorToast(message: string) {
   await openSidePanelForActiveTab()
   try {
     setTimeout(() => {
-      void sendMessage('sync-error', { message }, { context: 'popup' })
+      void safeSendMessage('sync-error', { message }, { context: 'popup' })
     }, 300)
   }
   catch {
@@ -848,6 +895,7 @@ async function runAutoUpload() {
   if (autoSyncInProgress)
     return
 
+  debugLog('Auto sync: start check')
   autoSyncInProgress = true
 
   try {
@@ -867,32 +915,39 @@ async function runAutoUpload() {
     if (provider === 'webdav') {
       if (!webdavUrl) {
         setActionBadge('idle')
+        debugLog('Auto sync skipped: missing webdavUrl')
         return
       }
     }
     else if (provider === 'gist') {
       if (!token || !gistId || !fileName) {
         setActionBadge('idle')
+        debugLog('Auto sync skipped: missing gist config')
         return
       }
     }
     else {
       setActionBadge('idle')
+      debugLog('Auto sync skipped: unknown provider', provider)
       return
     }
 
+    debugLog('Auto sync performSync upload, provider:', provider)
     setActionBadge('loading')
     const result = await performSync('upload')
     if (result.ok) {
       setActionBadge('idle')
+      debugLog('Auto sync upload ok')
       return
     }
 
     setActionBadge('error')
+    debugLog('Auto sync upload error', result.error)
     await sendSyncErrorToast(result.error || '同步失败')
   }
   catch (error) {
     setActionBadge('error')
+    debugLog('Auto sync upload exception', error)
     await sendSyncErrorToast(error instanceof Error ? error.message : '同步失败')
   }
   finally {
@@ -918,6 +973,7 @@ function scheduleAutoUpload() {
 
   autoSyncTimer = setTimeout(() => {
     autoSyncTimer = null
+    debugLog('Auto sync timer fired, runAutoUpload')
     void runAutoUpload()
   }, 2000)
 }
@@ -926,9 +982,11 @@ async function updateSyncIntervalAlarm(minutes: number) {
   if (!browser.alarms)
     return
   if (!minutes || minutes <= 0) {
+    debugLog('Clearing auto sync alarm')
     await browser.alarms.clear(AUTO_SYNC_ALARM_NAME)
     return
   }
+  debugLog('Creating auto sync alarm', minutes, 'minutes')
   await browser.alarms.create(AUTO_SYNC_ALARM_NAME, {
     delayInMinutes: minutes,
     periodInMinutes: minutes,
@@ -939,6 +997,7 @@ async function bootstrapSyncIntervalAlarm() {
   try {
     const stored = await browser.storage.local.get(['sync-interval-minutes'])
     const minutes = Number(stored['sync-interval-minutes'] || 0)
+    debugLog('Bootstrap auto sync alarm, minutes:', minutes)
     await updateSyncIntervalAlarm(Number.isFinite(minutes) ? minutes : 0)
   }
   catch {
@@ -946,10 +1005,14 @@ async function bootstrapSyncIntervalAlarm() {
   }
 }
 
+void bootstrapSyncIntervalAlarm()
+void normalizeSyncLogs()
+
 if (browser.alarms) {
   browser.alarms.onAlarm.addListener(async (alarm) => {
     if (alarm.name !== AUTO_SYNC_ALARM_NAME)
       return
+    debugLog('Auto sync alarm fired')
 
     try {
       const stored = await browser.storage.local.get([
@@ -968,10 +1031,12 @@ if (browser.alarms) {
       if (provider === 'webdav') {
         if (!webdavUrl)
           return
+        debugLog('Auto sync: WebDAV download trigger')
       }
       else if (provider === 'gist') {
         if (!token || !gistId || !fileName)
           return
+        debugLog('Auto sync: Gist download trigger')
       }
       else {
         return
@@ -990,8 +1055,19 @@ browser.storage.onChanged.addListener((changes, areaName) => {
     return
   if (changes['sync-interval-minutes']) {
     const nextValue = Number(changes['sync-interval-minutes'].newValue || 0)
+    debugLog('sync-interval-minutes changed to', nextValue)
     void updateSyncIntervalAlarm(Number.isFinite(nextValue) ? nextValue : 0)
   }
+})
+
+onMessage('refresh-sync-interval', async ({ data }) => {
+  let minutes = Number(data?.minutes)
+  if (!Number.isFinite(minutes)) {
+    const stored = await browser.storage.local.get(['sync-interval-minutes'])
+    minutes = Number(stored['sync-interval-minutes'] || 0)
+  }
+  await updateSyncIntervalAlarm(Number.isFinite(minutes) ? minutes : 0)
+  return { ok: true }
 })
 
 async function buildLocalIndex(root: browser.bookmarks.BookmarkTreeNode) {
@@ -1148,7 +1224,7 @@ browser.tabs.onActivated.addListener(async ({ tabId }) => {
 
   // eslint-disable-next-line no-console
   console.log('previous tab', tab)
-  sendMessage('tab-prev', { title: tab.title }, { context: 'content-script', tabId })
+  void safeSendMessage('tab-prev', { title: tab.title }, { context: 'content-script', tabId })
 })
 
 onMessage('get-current-tab', async () => {
@@ -1403,8 +1479,7 @@ async function performSync(mode: 'upload' | 'download') {
     // sync-folder-selection 可能是字符串（JSON）或数组，需要正确解析
     const selectedFolderIds = parseSelectedFolderIds(stored['sync-folder-selection'])
 
-    // eslint-disable-next-line no-console
-    console.log('[GistSync] selectedFolderIds from storage:', selectedFolderIds)
+    debugLog('performSync start', { mode, provider, selectedFolderIds })
 
     if (provider === 'webdav') {
       const baseUrl = (stored['webdav-url'] as string | undefined)?.trim()
@@ -1621,10 +1696,8 @@ async function performSync(mode: 'upload' | 'download') {
       const index = await buildLocalIndex(root)
       await ensureLocalEntries(root.id, index, mergedNodes)
 
-      const gistCount = countBookmarks(gistResult.gistNodes)
-      const localCount = countBookmarks(localNodes)
       const mergedCount = countBookmarks(mergedNodes)
-      const summary = `拉取成功 ${mergedCount} 条书签 (云端 ${gistCount}, 本地 ${localCount})`
+      const summary = `拉取成功 ${mergedCount} 条书签`
       const timestamp = new Date().toISOString()
 
       await browser.storage.local.set({

@@ -1,7 +1,7 @@
 {
   "name": "bookmark-sync",
   "displayName": "书签同步插件",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "private": true,
   "packageManager": "pnpm@9.7.1",
   "description": "多端书签同步与备份，支持 Gist 与 WebDAV，含侧边栏管理与历史版本回退。",
