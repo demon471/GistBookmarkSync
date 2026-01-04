@@ -12,6 +12,7 @@ export const { data: gistLastSyncSummary, dataReady: gistLastSyncSummaryReady } 
 export const { data: syncDirection, dataReady: syncDirectionReady } = useWebExtensionStorage('sync-direction', 'pull')
 export const { data: syncConflictStrategy, dataReady: syncConflictStrategyReady } = useWebExtensionStorage('sync-conflict-strategy', 'gist-wins')
 export const { data: syncFolderSelection, dataReady: syncFolderSelectionReady } = useWebExtensionStorage<string[]>('sync-folder-selection', [])
+export const { data: syncIntervalMinutes, dataReady: syncIntervalMinutesReady } = useWebExtensionStorage<number>('sync-interval-minutes', 0)
 export const { data: syncProvider, dataReady: syncProviderReady } = useWebExtensionStorage<'gist' | 'webdav'>('sync-provider', 'gist')
 
 export const { data: webdavUrl, dataReady: webdavUrlReady } = useWebExtensionStorage('webdav-url', '')

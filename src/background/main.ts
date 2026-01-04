@@ -20,6 +20,8 @@ if (USE_SIDE_PANEL) {
     .catch((error: unknown) => console.error(error))
 }
 
+void bootstrapSyncIntervalAlarm()
+
 browser.runtime.onInstalled.addListener((): void => {
   // eslint-disable-next-line no-console
   console.log('Extension installed')
@@ -31,6 +33,7 @@ let bookmarkEventSuspension = 0
 let autoSyncTimer: ReturnType<typeof setTimeout> | null = null
 let autoSyncInProgress = false
 let autoSyncPending = false
+const AUTO_SYNC_ALARM_NAME = 'auto-sync-interval'
 
 type SyncNode = {
   title: string
@@ -883,6 +886,78 @@ function scheduleAutoUpload() {
     void runAutoUpload()
   }, 2000)
 }
+
+async function updateSyncIntervalAlarm(minutes: number) {
+  if (!browser.alarms)
+    return
+  if (!minutes || minutes <= 0) {
+    await browser.alarms.clear(AUTO_SYNC_ALARM_NAME)
+    return
+  }
+  await browser.alarms.create(AUTO_SYNC_ALARM_NAME, {
+    delayInMinutes: minutes,
+    periodInMinutes: minutes,
+  })
+}
+
+async function bootstrapSyncIntervalAlarm() {
+  try {
+    const stored = await browser.storage.local.get(['sync-interval-minutes'])
+    const minutes = Number(stored['sync-interval-minutes'] || 0)
+    await updateSyncIntervalAlarm(Number.isFinite(minutes) ? minutes : 0)
+  }
+  catch {
+    // ignore
+  }
+}
+
+if (browser.alarms) {
+  browser.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm.name !== AUTO_SYNC_ALARM_NAME)
+      return
+
+    try {
+      const stored = await browser.storage.local.get([
+        'sync-provider',
+        'github-token',
+        'gist-id',
+        'gist-file-name',
+        'webdav-url',
+      ])
+      const provider = (stored['sync-provider'] as string | undefined) || 'gist'
+      const token = (stored['github-token'] as string | undefined)?.trim()
+      const gistId = (stored['gist-id'] as string | undefined)?.trim()
+      const fileName = (stored['gist-file-name'] as string | undefined)?.trim()
+      const webdavUrl = (stored['webdav-url'] as string | undefined)?.trim()
+
+      if (provider === 'webdav') {
+        if (!webdavUrl)
+          return
+      }
+      else if (provider === 'gist') {
+        if (!token || !gistId || !fileName)
+          return
+      }
+      else {
+        return
+      }
+
+      await performSync('download')
+    }
+    catch {
+      // ignore
+    }
+  })
+}
+
+browser.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local')
+    return
+  if (changes['sync-interval-minutes']) {
+    const nextValue = Number(changes['sync-interval-minutes'].newValue || 0)
+    void updateSyncIntervalAlarm(Number.isFinite(nextValue) ? nextValue : 0)
+  }
+})
 
 async function buildLocalIndex(root: browser.bookmarks.BookmarkTreeNode) {
   const index = new Map<string, LocalFolderInfo>()

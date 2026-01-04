@@ -12,6 +12,8 @@ import {
   lastValidationTime,
   syncFolderSelection,
   syncFolderSelectionReady,
+  syncIntervalMinutes,
+  syncIntervalMinutesReady,
   syncProvider,
   syncProviderReady,
   webdavConnectionStatus,
@@ -560,6 +562,7 @@ function exportConfig() {
     webdavUrl: webdavUrl.value,
     webdavUsername: webdavUsername.value,
     webdavPassword: webdavPassword.value,
+    syncIntervalMinutes: syncIntervalMinutes.value,
     syncFolderSelection: Array.from(selectedFolderIds.value),
   }
   const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' })
@@ -590,6 +593,8 @@ function importConfig() {
       if (config.webdavUrl) webdavUrl.value = config.webdavUrl
       if (config.webdavUsername) webdavUsername.value = config.webdavUsername
       if (config.webdavPassword) webdavPassword.value = config.webdavPassword
+      if (typeof config.syncIntervalMinutes === 'number')
+        syncIntervalMinutes.value = config.syncIntervalMinutes
       if (Array.isArray(config.syncFolderSelection)) {
         syncFolderSelection.value = config.syncFolderSelection
         selectedFolderIds.value = new Set(config.syncFolderSelection)
@@ -808,7 +813,7 @@ onMounted(() => {
       syncProvider.value = 'gist'
   })
 
-  Promise.all([syncProviderReady, githubTokenReady, gistIdReady, webdavUrlReady, syncFolderSelectionReady]).then(() => {
+  Promise.all([syncProviderReady, githubTokenReady, gistIdReady, webdavUrlReady, syncFolderSelectionReady, syncIntervalMinutesReady]).then(() => {
     void autoPullOnOpen()
   })
 })
@@ -908,7 +913,21 @@ watch(syncProvider, (nextProvider) => {
           </label>
           <input v-model="gistFileName" placeholder="bookmarks" class="input">
         </div>
-        <button class="btn btn--primary" :disabled="gistValidationState === 'checking'" @click="validateGistAuth">
+        <div class="field">
+          <label class="field__label">
+            <ph-timer class="field__icon" />
+            自动拉取间隔
+          </label>
+          <select v-model.number="syncIntervalMinutes" class="input">
+            <option :value="0">无</option>
+            <option :value="1">1 分钟</option>
+            <option :value="5">5 分钟</option>
+            <option :value="30">30 分钟</option>
+            <option :value="60">1 小时</option>
+            <option :value="180">3 小时</option>
+          </select>
+        </div>
+        <button class="btn btn--primary btn--input" :disabled="gistValidationState === 'checking'" @click="validateGistAuth">
           <ph-floppy-disk v-if="gistValidationState !== 'checking'" class="btn__icon" />
           <ph-circle-notch v-else class="btn__icon btn__icon--spin" />
           {{ gistValidationState === 'checking' ? '保存中…' : '保存配置' }}
@@ -937,7 +956,21 @@ watch(syncProvider, (nextProvider) => {
           </label>
           <input v-model="webdavPassword" type="password" placeholder="可选" class="input">
         </div>
-        <button class="btn btn--primary" :disabled="webdavValidationState === 'checking'" @click="validateWebdavAuth">
+        <div class="field">
+          <label class="field__label">
+            <ph-timer class="field__icon" />
+            自动拉取间隔
+          </label>
+          <select v-model.number="syncIntervalMinutes" class="input">
+            <option :value="0">无</option>
+            <option :value="1">1 分钟</option>
+            <option :value="5">5 分钟</option>
+            <option :value="30">30 分钟</option>
+            <option :value="60">1 小时</option>
+            <option :value="180">3 小时</option>
+          </select>
+        </div>
+        <button class="btn btn--primary btn--input" :disabled="webdavValidationState === 'checking'" @click="validateWebdavAuth">
           <ph-floppy-disk v-if="webdavValidationState !== 'checking'" class="btn__icon" />
           <ph-circle-notch v-else class="btn__icon btn__icon--spin" />
           {{ webdavValidationState === 'checking' ? '保存中…' : '保存配置' }}
@@ -1497,6 +1530,16 @@ watch(syncProvider, (nextProvider) => {
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
+select.input {
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--ink-muted) 50%),
+    linear-gradient(135deg, var(--ink-muted) 50%, transparent 50%);
+  background-position: calc(100% - 16px) calc(50% - 2px), calc(100% - 11px) calc(50% - 2px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 26px;
+}
+
 .input::placeholder {
   color: var(--ink-muted);
 }
@@ -1575,6 +1618,12 @@ watch(syncProvider, (nextProvider) => {
   border: none;
   cursor: pointer;
   transition: transform 0.15s, box-shadow 0.15s, opacity 0.15s;
+}
+
+.btn--input {
+  padding: 9px 11px;
+  font-size: 12px;
+  border-radius: 9px;
 }
 
 .btn:disabled {

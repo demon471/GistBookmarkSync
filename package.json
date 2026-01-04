@@ -1,10 +1,10 @@
 {
-  "name": "gist-bookmark-sync",
-  "displayName": "基于Gist的书签同步插件",
-  "version": "0.0.1",
+  "name": "bookmark-sync",
+  "displayName": "书签同步插件",
+  "version": "0.0.2",
   "private": true,
   "packageManager": "pnpm@9.7.1",
-  "description": "[description]",
+  "description": "多端书签同步与备份，支持 Gist 与 WebDAV，含侧边栏管理与历史版本回退。",
   "scripts": {
     "dev": "npm run clear && cross-env NODE_ENV=development run-p dev:*",
     "dev-firefox": "npm run clear && cross-env NODE_ENV=development EXTENSION=firefox run-p dev:*",
