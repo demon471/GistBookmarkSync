@@ -27,6 +27,10 @@ browser.runtime.onInstalled.addListener((): void => {
 
 let previousTabId = 0
 const sidePanelOpenByTab = new Map<number, boolean>()
+let bookmarkEventSuspension = 0
+let autoSyncTimer: ReturnType<typeof setTimeout> | null = null
+let autoSyncInProgress = false
+let autoSyncPending = false
 
 type SyncNode = {
   title: string
@@ -59,6 +63,7 @@ type WebDavVersionEntry = {
   file: string
   timestamp: string
   count?: number
+  seq?: number
 }
 
 function normalizeTitle(title?: string) {
@@ -257,6 +262,57 @@ function buildBookmarkPayloadText(nodes: SyncNode[]) {
   return `${JSON.stringify(buildBookmarkPayload(nodes))}\n`
 }
 
+async function buildGzipRequestBody(text: string) {
+  if (typeof CompressionStream === 'undefined') {
+    return {
+      body: text,
+      headers: { 'Content-Type': 'application/json' },
+      gzip: false,
+    }
+  }
+
+  const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'))
+  const buffer = await new Response(stream).arrayBuffer()
+  return {
+    body: new Uint8Array(buffer),
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Encoding': 'gzip',
+    },
+    gzip: true,
+  }
+}
+
+async function sendJsonRequestWithOptionalGzip(
+  url: string,
+  init: RequestInit,
+  payload: unknown,
+) {
+  const jsonText = JSON.stringify(payload)
+  const compressed = await buildGzipRequestBody(jsonText)
+  let response = await fetch(url, {
+    ...init,
+    headers: {
+      ...(init.headers || {}),
+      ...compressed.headers,
+    },
+    body: compressed.body,
+  })
+
+  if (!response.ok && compressed.gzip) {
+    response = await fetch(url, {
+      ...init,
+      headers: {
+        ...(init.headers || {}),
+        'Content-Type': 'application/json',
+      },
+      body: jsonText,
+    })
+  }
+
+  return response
+}
+
 function countBookmarksFromPayloadText(content: string) {
   try {
     const parsed = JSON.parse(content) as { bookmarks?: unknown }
@@ -293,6 +349,24 @@ function buildWebDavVersionsIndexPath() {
 
 function buildWebDavVersionFilePath(fileName: string) {
   return `gist-bookmark-sync/versions/${fileName}`
+}
+
+function getWebDavVersionSeqFromFile(fileName: string) {
+  const match = fileName.match(/^bookmark-(\d+)\.json$/)
+  if (!match)
+    return undefined
+  const value = Number(match[1])
+  return Number.isFinite(value) ? value : undefined
+}
+
+function getNextWebDavVersionSeq(entries: WebDavVersionEntry[]) {
+  let maxSeq = 0
+  for (const entry of entries) {
+    const seq = typeof entry.seq === 'number' ? entry.seq : getWebDavVersionSeqFromFile(entry.file)
+    if (typeof seq === 'number' && seq > maxSeq)
+      maxSeq = seq
+  }
+  return maxSeq + 1
 }
 
 function buildWebDavAuthHeaders(username?: string, password?: string) {
@@ -384,7 +458,13 @@ async function loadWebDavBookmarks(url: string, username?: string, password?: st
   if (!response.ok)
     return { ok: false, error: 'WebDAV 拉取失败，请检查地址配置' }
 
-  const content = await response.text()
+  let content = ''
+  try {
+    content = await readWebDavResponseText(response)
+  }
+  catch {
+    return { ok: false, error: 'WebDAV 文件读取失败' }
+  }
   let parsed: { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
   try {
     parsed = JSON.parse(content) as { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
@@ -432,14 +512,28 @@ async function applyWebDavDownload(
 
 async function updateWebDavFile(url: string, username: string | undefined, password: string | undefined, nodes: SyncNode[]) {
   const payload = buildBookmarkPayloadText(nodes)
-  const response = await fetch(url, {
-    method: 'PUT',
-    headers: {
-      'Content-Type': 'application/json',
-      ...buildWebDavAuthHeaders(username, password),
-    },
-    body: payload,
-  })
+  let response = await (async () => {
+    const compressed = await buildGzipRequestBody(payload)
+    return await fetch(url, {
+      method: 'PUT',
+      headers: {
+        ...compressed.headers,
+        ...buildWebDavAuthHeaders(username, password),
+      },
+      body: compressed.body,
+    })
+  })()
+
+  if (!response.ok && response.status !== 401 && response.status !== 403 && response.status !== 404) {
+    response = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildWebDavAuthHeaders(username, password),
+      },
+      body: payload,
+    })
+  }
 
   if (response.status === 401 || response.status === 403)
     return { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' }
@@ -471,6 +565,21 @@ async function updateWebDavRawFile(url: string, content: string, username: strin
   return { ok: true }
 }
 
+async function readWebDavResponseText(response: Response) {
+  const buffer = await response.arrayBuffer()
+  const bytes = new Uint8Array(buffer)
+  const isGzip = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b
+
+  if (isGzip) {
+    if (typeof DecompressionStream === 'undefined')
+      throw new Error('WebDAV gzip content unsupported')
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))
+    return await new Response(stream).text()
+  }
+
+  return new TextDecoder().decode(bytes)
+}
+
 async function loadWebDavVersionsIndex(baseUrl: string, username: string | undefined, password: string | undefined) {
   const indexUrl = buildWebDavFileUrl(baseUrl, buildWebDavVersionsIndexPath())
   const response = await fetch(indexUrl, {
@@ -487,7 +596,13 @@ async function loadWebDavVersionsIndex(baseUrl: string, username: string | undef
   if (!response.ok)
     return { ok: false, error: 'WebDAV 版本索引读取失败' }
 
-  const content = await response.text()
+  let content = ''
+  try {
+    content = await readWebDavResponseText(response)
+  }
+  catch {
+    return { ok: false, error: 'WebDAV 版本索引读取失败' }
+  }
   try {
     const parsed = JSON.parse(content) as WebDavVersionEntry[]
     if (!Array.isArray(parsed))
@@ -517,7 +632,12 @@ async function saveWebDavVersionSnapshot(
 ) {
   const timestamp = new Date().toISOString()
   const count = countBookmarksFromPayloadText(content)
-  const fileName = `${timestamp.replace(/[:.]/g, '-')}.json`
+  const indexResult = await loadWebDavVersionsIndex(baseUrl, username, password)
+  if (!indexResult.ok)
+    return indexResult
+
+  const nextSeq = getNextWebDavVersionSeq(indexResult.entries)
+  const fileName = `bookmark-${nextSeq}.json`
   const versionPath = buildWebDavVersionFilePath(fileName)
   const ensureResult = await ensureWebDavDirectories(baseUrl, versionPath, username, password)
   if (!ensureResult.ok)
@@ -527,11 +647,7 @@ async function saveWebDavVersionSnapshot(
   if (!writeResult.ok)
     return writeResult
 
-  const indexResult = await loadWebDavVersionsIndex(baseUrl, username, password)
-  if (!indexResult.ok)
-    return indexResult
-
-  const nextEntries = [{ file: fileName, timestamp, count }, ...indexResult.entries]
+  const nextEntries = [{ file: fileName, timestamp, count, seq: nextSeq }, ...indexResult.entries]
   const trimmed = nextEntries.slice(0, 50)
   const saveResult = await saveWebDavVersionsIndex(baseUrl, username, password, trimmed)
   if (!saveResult.ok)
@@ -542,21 +658,24 @@ async function saveWebDavVersionSnapshot(
 
 async function updateGistFile(token: string, gistId: string, fileName: string, nodes: SyncNode[]) {
   const payload = buildBookmarkPayload(nodes)
-  const updateResponse = await fetch(`https://api.github.com/gists/${gistId}`, {
-    method: 'PATCH',
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `token ${token}`,
-      'X-GitHub-Api-Version': '2022-11-28',
+  const updateResponse = await sendJsonRequestWithOptionalGzip(
+    `https://api.github.com/gists/${gistId}`,
+    {
+      method: 'PATCH',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `token ${token}`,
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
     },
-    body: JSON.stringify({
+    {
       files: {
         [fileName]: {
           content: `${JSON.stringify(payload)}\n`,
         },
       },
-    }),
-  })
+    },
+  )
 
   return updateResponse.ok
 }
@@ -596,6 +715,173 @@ function countBookmarks(nodes: SyncNode[]): number {
       count += countBookmarks(node.children)
   }
   return count
+}
+
+function setActionBadge(status: 'idle' | 'loading' | 'error') {
+  if (!browser.action?.setBadgeText)
+    return
+
+  if (status === 'idle') {
+    void browser.action.setBadgeText({ text: '' })
+    return
+  }
+
+  const text = status === 'loading' ? '…' : '!'
+  const color = status === 'loading' ? '#2f80ed' : '#d64545'
+  void browser.action.setBadgeText({ text })
+  void browser.action.setBadgeBackgroundColor?.({ color })
+}
+
+async function openSidePanelForActiveTab() {
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true })
+    const tabId = tab?.id
+    if (!tabId || !browser.sidePanel?.open)
+      return
+    // @ts-expect-error sidePanel is not typed in polyfill
+    void browser.sidePanel.setOptions?.({ tabId, path: 'dist/sidepanel/index.html', enabled: true })
+    // @ts-expect-error sidePanel is not typed in polyfill
+    void browser.sidePanel.open({ tabId })
+  }
+  catch {
+    // ignore
+  }
+}
+
+function parseSelectedFolderIds(rawSelection: unknown) {
+  let selectedFolderIds: string[] | undefined
+  if (typeof rawSelection === 'string') {
+    try {
+      selectedFolderIds = JSON.parse(rawSelection)
+    }
+    catch {
+      selectedFolderIds = undefined
+    }
+  }
+  else if (Array.isArray(rawSelection)) {
+    selectedFolderIds = rawSelection
+  }
+  return selectedFolderIds || []
+}
+
+async function isNodeInSelectedScope(nodeId: string, selectedSet: Set<string>) {
+  if (selectedSet.size === 0)
+    return true
+
+  let currentId: string | undefined = nodeId
+  const visited = new Set<string>()
+
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId)
+    if (selectedSet.has(currentId))
+      return true
+
+    try {
+      const [node] = await browser.bookmarks.get(currentId)
+      currentId = node?.parentId
+    }
+    catch {
+      return false
+    }
+  }
+
+  return false
+}
+
+async function isFolderInSelectedScope(folderId: string, selectedSet: Set<string>) {
+  if (!folderId)
+    return false
+  return await isNodeInSelectedScope(folderId, selectedSet)
+}
+
+async function sendSyncErrorToast(message: string) {
+  await openSidePanelForActiveTab()
+  try {
+    setTimeout(() => {
+      void sendMessage('sync-error', { message }, { context: 'popup' })
+    }, 300)
+  }
+  catch {
+    // ignore
+  }
+}
+
+async function runAutoUpload() {
+  if (autoSyncInProgress)
+    return
+
+  autoSyncInProgress = true
+
+  try {
+    const stored = await browser.storage.local.get([
+      'sync-provider',
+      'github-token',
+      'gist-id',
+      'gist-file-name',
+      'webdav-url',
+    ])
+    const provider = (stored['sync-provider'] as string | undefined) || 'gist'
+    const token = (stored['github-token'] as string | undefined)?.trim()
+    const gistId = (stored['gist-id'] as string | undefined)?.trim()
+    const fileName = (stored['gist-file-name'] as string | undefined)?.trim()
+    const webdavUrl = (stored['webdav-url'] as string | undefined)?.trim()
+
+    if (provider === 'webdav') {
+      if (!webdavUrl) {
+        setActionBadge('idle')
+        return
+      }
+    }
+    else if (provider === 'gist') {
+      if (!token || !gistId || !fileName) {
+        setActionBadge('idle')
+        return
+      }
+    }
+    else {
+      setActionBadge('idle')
+      return
+    }
+
+    setActionBadge('loading')
+    const result = await performSync('upload')
+    if (result.ok) {
+      setActionBadge('idle')
+      return
+    }
+
+    setActionBadge('error')
+    await sendSyncErrorToast(result.error || '同步失败')
+  }
+  catch (error) {
+    setActionBadge('error')
+    await sendSyncErrorToast(error instanceof Error ? error.message : '同步失败')
+  }
+  finally {
+    autoSyncInProgress = false
+    if (autoSyncPending) {
+      autoSyncPending = false
+      scheduleAutoUpload()
+    }
+  }
+}
+
+function scheduleAutoUpload() {
+  if (bookmarkEventSuspension > 0)
+    return
+
+  if (autoSyncInProgress) {
+    autoSyncPending = true
+    return
+  }
+
+  if (autoSyncTimer)
+    clearTimeout(autoSyncTimer)
+
+  autoSyncTimer = setTimeout(() => {
+    autoSyncTimer = null
+    void runAutoUpload()
+  }, 800)
 }
 
 async function buildLocalIndex(root: browser.bookmarks.BookmarkTreeNode) {
@@ -684,6 +970,53 @@ async function ensureLocalEntries(rootId: string, index: Map<string, LocalFolder
   await walk(nodes, '', rootId)
 }
 
+async function clearLocalBookmarks(root: browser.bookmarks.BookmarkTreeNode, selectedSet?: Set<string>) {
+  async function clearFolderContents(node: browser.bookmarks.BookmarkTreeNode, isSelected: boolean) {
+    if (!node.children)
+      return
+
+    for (const child of node.children) {
+      if (child.url) {
+        if (isSelected)
+          await browser.bookmarks.remove(child.id)
+        continue
+      }
+
+      const childSelected = selected.has(child.id)
+      if (isSelected) {
+        if (childSelected) {
+          await clearFolderContents(child, true)
+        }
+      }
+      else if (childSelected || hasSelectedDescendant(child)) {
+        await clearFolderContents(child, childSelected)
+      }
+    }
+  }
+
+  function hasSelectedDescendant(node: browser.bookmarks.BookmarkTreeNode): boolean {
+    if (!node.children)
+      return false
+    for (const child of node.children) {
+      if (selected.has(child.id))
+        return true
+      if (hasSelectedDescendant(child))
+        return true
+    }
+    return false
+  }
+
+  const selected = selectedSet || new Set<string>()
+  if (selected.size === 0) {
+    for (const rootFolder of root.children || [])
+      await clearFolderContents(rootFolder, true)
+    return
+  }
+
+  for (const rootFolder of root.children || [])
+    await clearFolderContents(rootFolder, selected.has(rootFolder.id))
+}
+
 // communication example: send previous tab title from background page
 // see shim.d.ts for type declaration
 browser.tabs.onActivated.addListener(async ({ tabId }) => {
@@ -740,14 +1073,17 @@ onMessage('validate-gist-auth', async ({ data }) => {
     return { ok: false, errors }
 
   async function createNewGist() {
-    const createResponse = await fetch('https://api.github.com/gists', {
-      method: 'POST',
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `token ${token}`,
-        'X-GitHub-Api-Version': '2022-11-28',
+    const createResponse = await sendJsonRequestWithOptionalGzip(
+      'https://api.github.com/gists',
+      {
+        method: 'POST',
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `token ${token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
       },
-      body: JSON.stringify({
+      {
         description: 'GistBookmarkSync',
         public: false,
         files: {
@@ -755,8 +1091,8 @@ onMessage('validate-gist-auth', async ({ data }) => {
             content: `${JSON.stringify(buildBookmarkPayload([]))}\n`,
           },
         },
-      }),
-    })
+      },
+    )
 
     if (!createResponse.ok)
       return { ok: false, errors: ['Failed to create new Gist'] }
@@ -809,21 +1145,24 @@ onMessage('validate-gist-auth', async ({ data }) => {
     if (!autoCreate)
       return { ok: false, errors: ['Gist file name not found'] }
 
-    const createResponse = await fetch(`https://api.github.com/gists/${gistId}`, {
-      method: 'PATCH',
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `token ${token}`,
-        'X-GitHub-Api-Version': '2022-11-28',
+    const createResponse = await sendJsonRequestWithOptionalGzip(
+      `https://api.github.com/gists/${gistId}`,
+      {
+        method: 'PATCH',
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `token ${token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
       },
-      body: JSON.stringify({
+      {
         files: {
           [fileName]: {
             content: `${JSON.stringify(buildBookmarkPayload([]))}\n`,
           },
         },
-      }),
-    })
+      },
+    )
 
     if (!createResponse.ok)
       return { ok: false, errors: ['Failed to create Gist file'] }
@@ -949,19 +1288,7 @@ async function performSync(mode: 'upload' | 'download') {
   const conflictStrategy = (stored['sync-conflict-strategy'] as string | undefined) || 'gist-wins'
 
   // sync-folder-selection 可能是字符串（JSON）或数组，需要正确解析
-  let selectedFolderIds: string[] | undefined
-  const rawSelection = stored['sync-folder-selection']
-  if (typeof rawSelection === 'string') {
-    try {
-      selectedFolderIds = JSON.parse(rawSelection)
-    }
-    catch {
-      selectedFolderIds = undefined
-    }
-  }
-  else if (Array.isArray(rawSelection)) {
-    selectedFolderIds = rawSelection
-  }
+  const selectedFolderIds = parseSelectedFolderIds(stored['sync-folder-selection'])
 
   // eslint-disable-next-line no-console
   console.log('[GistSync] selectedFolderIds from storage:', selectedFolderIds)
@@ -1052,17 +1379,6 @@ async function performSync(mode: 'upload' | 'download') {
         }
       }
 
-      if (existingText) {
-        const versionResult = await saveWebDavVersionSnapshot(baseUrl, username, password, existingText)
-        if (!versionResult.ok) {
-          await browser.storage.local.set({
-            'webdav-connection-status': 'error',
-            'webdav-last-validation-time': Date.now(),
-          })
-          return { ok: false, error: versionResult.error }
-        }
-      }
-
       const updated = await updateWebDavFile(fileUrl, username, password, localNodes)
       if (!updated.ok) {
         await browser.storage.local.set({
@@ -1070,6 +1386,15 @@ async function performSync(mode: 'upload' | 'download') {
           'webdav-last-validation-time': Date.now(),
         })
         return { ok: false, error: updated.error }
+      }
+
+      const versionResult = await saveWebDavVersionSnapshot(baseUrl, username, password, payloadText)
+      if (!versionResult.ok) {
+        await browser.storage.local.set({
+          'webdav-connection-status': 'error',
+          'webdav-last-validation-time': Date.now(),
+        })
+        return { ok: false, error: versionResult.error }
       }
 
       const localCount = countBookmarks(localNodes)
@@ -1105,7 +1430,13 @@ async function performSync(mode: 'upload' | 'download') {
       'webdav-last-validation-time': Date.now(),
     })
 
-    return await applyWebDavDownload(webdavResult.nodes, root, localNodes, selectedFolderIds)
+    bookmarkEventSuspension += 1
+    try {
+      return await applyWebDavDownload(webdavResult.nodes, root, localNodes, selectedFolderIds)
+    }
+    finally {
+      bookmarkEventSuspension = Math.max(0, bookmarkEventSuspension - 1)
+    }
   }
 
   if (!token || !gistId || !fileName) {
@@ -1169,30 +1500,36 @@ async function performSync(mode: 'upload' | 'download') {
   }
 
   // 下载模式：合并云端和本地书签
-  const mergedNodes = mergeNodeLists(localNodes, gistResult.gistNodes)
+  bookmarkEventSuspension += 1
+  try {
+    const mergedNodes = mergeNodeLists(localNodes, gistResult.gistNodes)
 
-  const index = await buildLocalIndex(root)
-  await ensureLocalEntries(root.id, index, mergedNodes)
+    const index = await buildLocalIndex(root)
+    await ensureLocalEntries(root.id, index, mergedNodes)
 
-  const gistCount = countBookmarks(gistResult.gistNodes)
-  const localCount = countBookmarks(localNodes)
-  const mergedCount = countBookmarks(mergedNodes)
-  const summary = `拉取成功 ${mergedCount} 条书签 (云端 ${gistCount}, 本地 ${localCount})`
-  const timestamp = new Date().toISOString()
+    const gistCount = countBookmarks(gistResult.gistNodes)
+    const localCount = countBookmarks(localNodes)
+    const mergedCount = countBookmarks(mergedNodes)
+    const summary = `拉取成功 ${mergedCount} 条书签 (云端 ${gistCount}, 本地 ${localCount})`
+    const timestamp = new Date().toISOString()
 
-  await browser.storage.local.set({
-    'gist-bookmarks-cache': { version: 1, bookmarks: mergedNodes },
-    'gist-last-sync': timestamp,
-    'gist-last-sync-summary': summary,
-    'gist-last-sync-direction': syncDirection,
-    'gist-last-sync-strategy': conflictStrategy,
-    'gist-last-sync-folders': selectedFolderIds || [],
-  })
+    await browser.storage.local.set({
+      'gist-bookmarks-cache': { version: 1, bookmarks: mergedNodes },
+      'gist-last-sync': timestamp,
+      'gist-last-sync-summary': summary,
+      'gist-last-sync-direction': syncDirection,
+      'gist-last-sync-strategy': conflictStrategy,
+      'gist-last-sync-folders': selectedFolderIds || [],
+    })
 
-  return {
-    ok: true,
-    summary,
-    timestamp,
+    return {
+      ok: true,
+      summary,
+      timestamp,
+    }
+  }
+  finally {
+    bookmarkEventSuspension = Math.max(0, bookmarkEventSuspension - 1)
   }
 }
 
@@ -1233,8 +1570,51 @@ onMessage('webdav-list-versions', async () => {
 
   return {
     ok: true,
-    versions: sorted.slice(0, 10),
+    versions: sorted.slice(0, 5),
   }
+})
+
+onMessage('webdav-delete-version', async ({ data }) => {
+  const file = data?.file as string | undefined
+  if (!file)
+    return { ok: false, error: '缺少版本文件' }
+
+  const stored = await browser.storage.local.get([
+    'webdav-url',
+    'webdav-username',
+    'webdav-password',
+  ])
+  const baseUrl = (stored['webdav-url'] as string | undefined)?.trim()
+  const username = (stored['webdav-username'] as string | undefined) || ''
+  const password = (stored['webdav-password'] as string | undefined) || ''
+
+  if (!baseUrl)
+    return { ok: false, error: '请先配置 WebDAV 地址' }
+
+  const versionPath = buildWebDavVersionFilePath(file)
+  const versionUrl = buildWebDavFileUrl(baseUrl, versionPath)
+  const response = await fetch(versionUrl, {
+    method: 'DELETE',
+    headers: {
+      ...buildWebDavAuthHeaders(username, password),
+    },
+  })
+
+  if (response.status === 401 || response.status === 403)
+    return { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' }
+  if (!response.ok && response.status !== 404)
+    return { ok: false, error: 'WebDAV 删除版本失败' }
+
+  const indexResult = await loadWebDavVersionsIndex(baseUrl, username, password)
+  if (!indexResult.ok)
+    return { ok: false, error: indexResult.error }
+
+  const nextEntries = indexResult.entries.filter((entry) => entry.file !== file)
+  const saveResult = await saveWebDavVersionsIndex(baseUrl, username, password, nextEntries)
+  if (!saveResult.ok)
+    return { ok: false, error: saveResult.error }
+
+  return { ok: true }
 })
 
 onMessage('webdav-download-version', async ({ data }) => {
@@ -1255,19 +1635,7 @@ onMessage('webdav-download-version', async ({ data }) => {
   if (!baseUrl)
     return { ok: false, error: '请先配置 WebDAV 地址' }
 
-  let selectedFolderIds: string[] | undefined
-  const rawSelection = stored['sync-folder-selection']
-  if (typeof rawSelection === 'string') {
-    try {
-      selectedFolderIds = JSON.parse(rawSelection)
-    }
-    catch {
-      selectedFolderIds = undefined
-    }
-  }
-  else if (Array.isArray(rawSelection)) {
-    selectedFolderIds = rawSelection
-  }
+  const selectedFolderIds = parseSelectedFolderIds(stored['sync-folder-selection'])
 
   const localResult = await loadLocalNodes(selectedFolderIds)
   if (!localResult.ok)
@@ -1289,7 +1657,17 @@ onMessage('webdav-download-version', async ({ data }) => {
     'webdav-last-validation-time': Date.now(),
   })
 
-  return await applyWebDavDownload(webdavResult.nodes, localResult.root, localResult.localNodes, selectedFolderIds)
+  bookmarkEventSuspension += 1
+  try {
+    await clearLocalBookmarks(localResult.root, new Set(selectedFolderIds))
+    const refreshedLocal = await loadLocalNodes(selectedFolderIds)
+    if (!refreshedLocal.ok)
+      return { ok: false, error: refreshedLocal.error }
+    return await applyWebDavDownload(webdavResult.nodes, refreshedLocal.root, refreshedLocal.localNodes, selectedFolderIds)
+  }
+  finally {
+    bookmarkEventSuspension = Math.max(0, bookmarkEventSuspension - 1)
+  }
 })
 
 onMessage('open-sidepanel', ({ sender }) => {
@@ -1330,6 +1708,48 @@ onMessage('open-sidepanel', ({ sender }) => {
   }
 })
 
+async function shouldTriggerAutoSync(nodeId?: string, parentId?: string, oldParentId?: string) {
+  if (bookmarkEventSuspension > 0)
+    return false
+
+  const stored = await browser.storage.local.get(['sync-folder-selection'])
+  const selectedSet = new Set(parseSelectedFolderIds(stored['sync-folder-selection']))
+
+  if (selectedSet.size === 0)
+    return true
+
+  if (nodeId && await isNodeInSelectedScope(nodeId, selectedSet))
+    return true
+
+  if (parentId && await isFolderInSelectedScope(parentId, selectedSet))
+    return true
+
+  if (oldParentId && await isFolderInSelectedScope(oldParentId, selectedSet))
+    return true
+
+  return false
+}
+
+browser.bookmarks.onCreated.addListener(async (id, node) => {
+  if (await shouldTriggerAutoSync(id, node.parentId))
+    scheduleAutoUpload()
+})
+
+browser.bookmarks.onChanged.addListener(async (id) => {
+  if (await shouldTriggerAutoSync(id))
+    scheduleAutoUpload()
+})
+
+browser.bookmarks.onMoved.addListener(async (id, moveInfo) => {
+  if (await shouldTriggerAutoSync(id, moveInfo.parentId, moveInfo.oldParentId))
+    scheduleAutoUpload()
+})
+
+browser.bookmarks.onRemoved.addListener(async (_id, removeInfo) => {
+  if (await shouldTriggerAutoSync(undefined, removeInfo.parentId))
+    scheduleAutoUpload()
+})
+
 onMessage('sidepanel-visibility', ({ sender, data }) => {
   const tabId = (data as { tabId?: number } | undefined)?.tabId ?? sender?.tabId ?? sender?.tab?.id
   if (!tabId)
@@ -1346,31 +1766,7 @@ onMessage('clear-bookmarks', async () => {
     if (!root)
       return { ok: false, success: false, error: 'Failed to read bookmarks' }
 
-    // 递归删除所有书签和文件夹（保留根节点的直接子文件夹如"书签栏"、"其他书签"）
-    async function clearFolder(node: browser.bookmarks.BookmarkTreeNode) {
-      if (!node.children)
-        return
-
-      for (const child of node.children) {
-        if (child.url) {
-          // 删除书签
-          await browser.bookmarks.remove(child.id)
-        }
-        else if (child.children) {
-          // 递归清空子文件夹内容
-          await clearFolder(child)
-          // 如果不是根级文件夹（书签栏、其他书签等），则删除空文件夹
-          if (child.parentId !== root.id) {
-            await browser.bookmarks.remove(child.id)
-          }
-        }
-      }
-    }
-
-    // 清空每个根级文件夹的内容
-    for (const rootFolder of root.children || []) {
-      await clearFolder(rootFolder)
-    }
+    await clearLocalBookmarks(root)
 
     // 清除保存的文件夹选择状态，这样下次下载时会是全选状态
     await browser.storage.local.remove('sync-folder-selection')

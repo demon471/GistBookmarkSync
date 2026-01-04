@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { sendMessage } from 'webext-bridge/popup'
+import { onMessage, sendMessage } from 'webext-bridge/popup'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   connectionStatus,
@@ -229,6 +229,11 @@ async function checkConnection(force = false) {
   }
 }
 
+onMessage('sync-error', ({ data }) => {
+  const message = typeof data?.message === 'string' ? data.message : '同步失败'
+  showToast(message, 'error')
+})
+
 async function validateGistAuth() {
   gistValidationState.value = 'checking'
 
@@ -427,7 +432,7 @@ function handleDownloadClick() {
   void downloadBookmarks()
 }
 
-async function openWebdavVersions() {
+async function loadWebdavVersions() {
   if (syncProvider.value !== 'webdav')
     return
 
@@ -436,10 +441,8 @@ async function openWebdavVersions() {
     downloadClickTimer = null
   }
 
-  webdavVersionsVisible.value = true
   webdavVersionsState.value = 'loading'
   webdavVersionsMessage.value = ''
-  webdavVersions.value = []
 
   try {
     const result = await sendMessage('webdav-list-versions', undefined, 'background') as { ok: boolean, error?: string, versions?: Array<{ file: string, timestamp: string, count?: number }> }
@@ -456,6 +459,11 @@ async function openWebdavVersions() {
     webdavVersionsState.value = 'error'
     webdavVersionsMessage.value = error instanceof Error ? error.message : '加载版本失败'
   }
+}
+
+async function openWebdavVersions() {
+  webdavVersionsVisible.value = true
+  await loadWebdavVersions()
 }
 
 async function downloadWebdavVersion(file: string) {
@@ -480,6 +488,22 @@ async function downloadWebdavVersion(file: string) {
   }
 }
 
+async function deleteWebdavVersion(file: string) {
+  try {
+    const result = await sendMessage('webdav-delete-version', { file }, 'background') as { ok: boolean, error?: string }
+    if (!result.ok) {
+      showToast(result.error || '删除失败', 'error')
+      return
+    }
+
+    showToast('已删除版本', 'success')
+    await loadWebdavVersions()
+  }
+  catch (error) {
+    showToast(error instanceof Error ? error.message : '删除失败', 'error')
+  }
+}
+
 function parseWebdavVersionLabel(item: { file: string, timestamp: string }) {
   const match = item.file.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-\d+Z\.json$/)
   if (match) {
@@ -499,10 +523,15 @@ function parseWebdavVersionLabel(item: { file: string, timestamp: string }) {
   return item.timestamp
 }
 
-function formatWebdavFileLabel(file: string) {
-  if (file.endsWith('.json'))
-    return file.replace(/\.json$/, '')
-  return file
+function formatWebdavFileLabel(item: { file: string, seq?: number }) {
+  if (typeof item.seq === 'number')
+    return `bookmark #${item.seq}`
+  const match = item.file.match(/^bookmark-(\d+)\.json$/)
+  if (match)
+    return `bookmark #${match[1]}`
+  if (item.file.endsWith('.json'))
+    return item.file.replace(/\.json$/, '')
+  return item.file
 }
 
 function exportConfig() {
@@ -689,10 +718,43 @@ async function loadFolderTree() {
   }
 }
 
-function saveFolderSelection() {
-  syncFolderSelection.value = Array.from(selectedFolderIds.value)
-  savedFolderIds.value = new Set(selectedFolderIds.value)
-  showToast('同步范围已保存', 'success')
+async function saveFolderSelection() {
+  const selection = Array.from(selectedFolderIds.value)
+  syncFolderSelection.value = selection
+  savedFolderIds.value = new Set(selection)
+  await browser.storage.local.set({ 'sync-folder-selection': selection })
+  void triggerUploadAfterSave()
+}
+
+async function triggerUploadAfterSave() {
+  if (syncProvider.value === 'webdav') {
+    if (!webdavUrl.value?.trim()) {
+      showToast('同步范围已保存', 'success')
+      return
+    }
+  }
+  else {
+    if (!githubToken.value?.trim() || !gistId.value?.trim() || !gistFileName.value?.trim()) {
+      showToast('同步范围已保存', 'success')
+      return
+    }
+  }
+
+  try {
+    uploadState.value = 'syncing'
+    const result = await sendMessage('sync-upload', undefined, 'background')
+    if (result.ok) {
+      uploadState.value = 'done'
+      showToast(result.summary || '同步范围已保存并推送', 'success')
+      return
+    }
+    uploadState.value = 'error'
+    showToast(result.error || '同步范围已保存，但推送失败', 'error')
+  }
+  catch (error) {
+    uploadState.value = 'error'
+    showToast(error instanceof Error ? error.message : '同步范围已保存，但推送失败', 'error')
+  }
 }
 
 onMounted(() => {
@@ -997,7 +1059,7 @@ watch(syncProvider, (nextProvider) => {
             <h3 class="modal__title">历史版本</h3>
           </div>
           <div class="modal__body">
-            <div v-if="webdavVersionsState === 'loading'" class="tree-loading">
+            <div v-if="webdavVersionsState === 'loading' && webdavVersions.length === 0" class="tree-loading">
               <ph-circle-notch class="tree-loading__icon" />
               <span>加载版本…</span>
             </div>
@@ -1008,17 +1070,30 @@ watch(syncProvider, (nextProvider) => {
               暂无历史版本
             </div>
             <div v-else class="version-list">
+              <div v-if="webdavVersionsState === 'loading'" class="version-loading">
+                <ph-circle-notch class="tree-loading__icon" />
+                <span>刷新中…</span>
+              </div>
               <div v-for="item in webdavVersions" :key="item.file" class="version-item">
                 <div class="version-meta">
-                  <div class="version-title">
+                  <div class="version-time">
                     {{ parseWebdavVersionLabel(item) }}
+                    <button class="btn btn--danger-inline" @click="deleteWebdavVersion(item.file)">
+                      <ph-trash class="btn__icon" />
+                      删除
+                    </button>
+                  </div>
+                  <div class="version-meta-row">
+                    <span class="version-name">{{ formatWebdavFileLabel(item) }}</span>
                     <span v-if="typeof item.count === 'number'" class="version-count">{{ item.count }} 条</span>
                   </div>
-                  <div class="version-subtitle">{{ formatWebdavFileLabel(item.file) }}</div>
                 </div>
-                <button class="btn btn--ghost" @click="downloadWebdavVersion(item.file)">
-                  回退
-                </button>
+                <div class="version-actions">
+                  <button class="btn btn--rollback" @click="downloadWebdavVersion(item.file)">
+                    <ph-clock-counter-clockwise class="btn__icon" />
+                    回退
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -1250,43 +1325,124 @@ watch(syncProvider, (nextProvider) => {
 .version-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 6px;
+  position: relative;
+  min-height: 44px;
 }
 
 .version-item {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto;
   align-items: center;
-  justify-content: space-between;
-  padding: 8px 10px;
+  gap: 12px;
+  padding: 10px 12px;
   border-radius: 10px;
   border: 1px solid var(--card-border);
   background: var(--bg-glass);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
 }
 
 .version-meta {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 6px;
+  min-width: 0;
 }
 
-.version-title {
-  font-size: 12px;
+.version-time {
+  font-size: 13px;
   font-weight: 600;
   color: var(--ink);
+  letter-spacing: 0.02em;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 10px;
 }
 
-.version-subtitle {
-  font-size: 11px;
+.version-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
   color: var(--ink-muted);
+  font-size: 11px;
 }
 
 .version-count {
-  font-size: 11px;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.version-name {
+  opacity: 0.9;
+}
+
+.version-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-direction: column;
+}
+
+.btn--danger-inline {
+  padding: 4px 8px;
+  font-size: 10px;
+  border-radius: 8px;
+  border: 1px dashed rgba(220, 53, 69, 0.5);
+  color: var(--danger);
+  background: transparent;
+}
+
+.btn--danger-inline:not(:disabled):hover {
+  color: var(--danger);
+  border-color: rgba(220, 53, 69, 0.8);
+}
+
+.version-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 12px;
   color: var(--ink-muted);
-  font-weight: 500;
+  background: rgba(255, 255, 255, 0.55);
+  backdrop-filter: blur(3px);
+  border-radius: 10px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .version-loading {
+    background: rgba(12, 12, 12, 0.6);
+  }
+}
+
+.btn--rollback {
+  background: linear-gradient(135deg, #ff8866 0%, #ff6f45 100%);
+  color: #fff;
+  border: none;
+  padding: 6px 10px;
+  border-radius: 9px;
+  box-shadow: 0 8px 18px rgba(255, 136, 102, 0.25);
+}
+
+.btn--danger-outline {
+  background: transparent;
+  color: var(--danger);
+  border: 1px dashed rgba(220, 53, 69, 0.55);
+  padding: 5px 10px;
+  border-radius: 9px;
+}
+
+.btn--danger-outline:not(:disabled):hover {
+  background: rgba(220, 53, 69, 0.12);
+  color: #fff;
+  border-color: transparent;
+  box-shadow: 0 6px 16px rgba(220, 53, 69, 0.25);
 }
 
 /* Field */
@@ -1390,10 +1546,10 @@ watch(syncProvider, (nextProvider) => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  padding: 9px 14px;
+  gap: 4px;
+  padding: 7px 11px;
   border-radius: 9px;
-  font-size: 12px;
+  font-size: 10.5px;
   font-weight: 600;
   border: none;
   cursor: pointer;
@@ -1414,7 +1570,7 @@ watch(syncProvider, (nextProvider) => {
 }
 
 .btn__icon {
-  font-size: 14px;
+  font-size: 12px;
 }
 
 .btn__icon--spin {
@@ -1708,7 +1864,7 @@ watch(syncProvider, (nextProvider) => {
   font-size: 12px;
   font-weight: 500;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
-  z-index: 1000;
+  z-index: 2000;
   backdrop-filter: blur(8px);
 }
 
@@ -1752,7 +1908,7 @@ watch(syncProvider, (nextProvider) => {
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
+  z-index: 1500;
   padding: 16px;
 }
 
