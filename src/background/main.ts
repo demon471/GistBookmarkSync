@@ -750,6 +750,15 @@ onMessage('open-sidepanel', ({ sender }) => {
   }
 })
 
+onMessage('sidepanel-visibility', ({ sender, data }) => {
+  const tabId = (data as { tabId?: number } | undefined)?.tabId ?? sender?.tabId ?? sender?.tab?.id
+  if (!tabId)
+    return { ok: false, error: 'No tab id from sender' }
+
+  sidePanelOpenByTab.set(tabId, Boolean((data as { open?: boolean } | undefined)?.open))
+  return { ok: true }
+})
+
 onMessage('clear-bookmarks', async () => {
   try {
     const tree = await browser.bookmarks.getTree()

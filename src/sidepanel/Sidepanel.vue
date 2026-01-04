@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { sendMessage } from 'webext-bridge/popup'
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { connectionStatus, connectionStatusReady, gistFileName, gistId, gistIdReady, githubToken, githubTokenReady, lastValidationTime, syncFolderSelection } from '~/logic/storage'
 
 type FolderNode = {
@@ -18,6 +18,48 @@ const folderTreeState = ref<'idle' | 'loading' | 'error'>('idle')
 const folderTreeMessage = ref('')
 const selectedFolderIds = ref(new Set<string>())
 const savedFolderIds = ref(new Set<string>()) // 已保存的选择，用于统计
+const currentTabId = ref<number | null>(null)
+
+async function resolveTabId() {
+  if (currentTabId.value !== null) return
+  try {
+    const tabs = await browser.tabs.query({ active: true, currentWindow: true })
+    const tabId = tabs[0]?.id
+    if (typeof tabId === 'number')
+      currentTabId.value = tabId
+  }
+  catch {
+    // ignore if tab query fails
+  }
+}
+
+async function notifySidepanelOpen() {
+  await resolveTabId()
+  if (currentTabId.value === null) return
+  void sendMessage('sidepanel-visibility', { open: true, tabId: currentTabId.value }, 'background')
+}
+
+async function notifySidepanelClosed() {
+  await resolveTabId()
+  if (currentTabId.value === null) return
+  void sendMessage('sidepanel-visibility', { open: false, tabId: currentTabId.value }, 'background')
+}
+
+function handleSidepanelHide() {
+  void notifySidepanelClosed()
+}
+
+onMounted(() => {
+  void notifySidepanelOpen()
+  window.addEventListener('pagehide', handleSidepanelHide)
+  window.addEventListener('beforeunload', handleSidepanelHide)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('pagehide', handleSidepanelHide)
+  window.removeEventListener('beforeunload', handleSidepanelHide)
+  void notifySidepanelClosed()
+})
 
 // 检测同步范围是否有未保存的变化
 const hasUnsavedChanges = computed(() => {
