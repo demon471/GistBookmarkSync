@@ -39,6 +39,11 @@ const folderTreeMessage = ref('')
 const selectedFolderIds = ref(new Set<string>())
 const savedFolderIds = ref(new Set<string>()) // 已保存的选择，用于统计
 const currentTabId = ref<number | null>(null)
+const webdavVersionsVisible = ref(false)
+const webdavVersionsState = ref<'idle' | 'loading' | 'error'>('idle')
+const webdavVersionsMessage = ref('')
+const webdavVersions = ref<Array<{ file: string, timestamp: string, count?: number }>>([])
+let downloadClickTimer: ReturnType<typeof setTimeout> | null = null
 
 const activeValidationState = computed(() => {
   return syncProvider.value === 'webdav' ? webdavValidationState.value : gistValidationState.value
@@ -406,6 +411,98 @@ async function downloadBookmarks() {
     downloadState.value = 'error'
     showToast(error instanceof Error ? error.message : '拉取失败', 'error')
   }
+}
+
+function handleDownloadClick() {
+  if (syncProvider.value === 'webdav') {
+    if (downloadClickTimer)
+      clearTimeout(downloadClickTimer)
+    downloadClickTimer = setTimeout(() => {
+      downloadClickTimer = null
+      void downloadBookmarks()
+    }, 240)
+    return
+  }
+
+  void downloadBookmarks()
+}
+
+async function openWebdavVersions() {
+  if (syncProvider.value !== 'webdav')
+    return
+
+  if (downloadClickTimer) {
+    clearTimeout(downloadClickTimer)
+    downloadClickTimer = null
+  }
+
+  webdavVersionsVisible.value = true
+  webdavVersionsState.value = 'loading'
+  webdavVersionsMessage.value = ''
+  webdavVersions.value = []
+
+  try {
+    const result = await sendMessage('webdav-list-versions', undefined, 'background') as { ok: boolean, error?: string, versions?: Array<{ file: string, timestamp: string, count?: number }> }
+    if (!result.ok) {
+      webdavVersionsState.value = 'error'
+      webdavVersionsMessage.value = result.error || '加载版本失败'
+      return
+    }
+
+    webdavVersions.value = result.versions || []
+    webdavVersionsState.value = 'idle'
+  }
+  catch (error) {
+    webdavVersionsState.value = 'error'
+    webdavVersionsMessage.value = error instanceof Error ? error.message : '加载版本失败'
+  }
+}
+
+async function downloadWebdavVersion(file: string) {
+  webdavVersionsVisible.value = false
+  downloadState.value = 'syncing'
+
+  try {
+    const result = await sendMessage('webdav-download-version', { file }, 'background') as { ok: boolean, error?: string, summary?: string }
+    if (result.ok) {
+      downloadState.value = 'done'
+      showToast(result.summary || '回退成功', 'success')
+      void loadFolderTree()
+      return
+    }
+
+    downloadState.value = 'error'
+    showToast(result.error || '回退失败', 'error')
+  }
+  catch (error) {
+    downloadState.value = 'error'
+    showToast(error instanceof Error ? error.message : '回退失败', 'error')
+  }
+}
+
+function parseWebdavVersionLabel(item: { file: string, timestamp: string }) {
+  const match = item.file.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-\d+Z\.json$/)
+  if (match) {
+    const [, , month, day, hour, minute] = match
+    return `${month}/${day} ${hour}:${minute}`
+  }
+
+  const date = new Date(item.timestamp)
+  if (!Number.isNaN(date.getTime())) {
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    const hour = String(date.getHours()).padStart(2, '0')
+    const minute = String(date.getMinutes()).padStart(2, '0')
+    return `${month}/${day} ${hour}:${minute}`
+  }
+
+  return item.timestamp
+}
+
+function formatWebdavFileLabel(file: string) {
+  if (file.endsWith('.json'))
+    return file.replace(/\.json$/, '')
+  return file
 }
 
 function exportConfig() {
@@ -779,7 +876,12 @@ watch(syncProvider, (nextProvider) => {
           <span class="action-tile__icon"><ph-upload-simple /></span>
           <span class="action-tile__label">导出配置</span>
         </button>
-        <button class="action-tile action-tile--cyan" :disabled="downloadState === 'syncing' || activeValidationState !== 'ok'" @click="downloadBookmarks">
+        <button
+          class="action-tile action-tile--cyan"
+          :disabled="downloadState === 'syncing' || activeValidationState !== 'ok'"
+          @click="handleDownloadClick"
+          @dblclick="openWebdavVersions"
+        >
           <span class="action-tile__icon">
             <ph-cloud-arrow-down v-if="downloadState !== 'syncing'" />
             <ph-circle-notch v-else class="btn__icon--spin" />
@@ -881,6 +983,47 @@ watch(syncProvider, (nextProvider) => {
           <div class="modal__footer">
             <button class="btn btn--ghost" @click="exportModalVisible = false">取消</button>
             <button class="btn btn--primary" @click="doExportBookmarks">导出</button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- WebDAV 历史版本 -->
+    <Transition name="modal">
+      <div v-if="webdavVersionsVisible" class="modal-overlay" @click.self="webdavVersionsVisible = false">
+        <div class="modal">
+          <div class="modal__header">
+            <ph-clock-counter-clockwise class="modal__icon" />
+            <h3 class="modal__title">历史版本</h3>
+          </div>
+          <div class="modal__body">
+            <div v-if="webdavVersionsState === 'loading'" class="tree-loading">
+              <ph-circle-notch class="tree-loading__icon" />
+              <span>加载版本…</span>
+            </div>
+            <div v-else-if="webdavVersionsState === 'error'" class="message" data-state="error">
+              {{ webdavVersionsMessage }}
+            </div>
+            <div v-else-if="webdavVersions.length === 0" class="message" data-state="info">
+              暂无历史版本
+            </div>
+            <div v-else class="version-list">
+              <div v-for="item in webdavVersions" :key="item.file" class="version-item">
+                <div class="version-meta">
+                  <div class="version-title">
+                    {{ parseWebdavVersionLabel(item) }}
+                    <span v-if="typeof item.count === 'number'" class="version-count">{{ item.count }} 条</span>
+                  </div>
+                  <div class="version-subtitle">{{ formatWebdavFileLabel(item.file) }}</div>
+                </div>
+                <button class="btn btn--ghost" @click="downloadWebdavVersion(item.file)">
+                  回退
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="modal__footer">
+            <button class="btn btn--ghost" @click="webdavVersionsVisible = false">关闭</button>
           </div>
         </div>
       </div>
@@ -1102,6 +1245,48 @@ watch(syncProvider, (nextProvider) => {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.version-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.version-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--card-border);
+  background: var(--bg-glass);
+}
+
+.version-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.version-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.version-subtitle {
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
+.version-count {
+  font-size: 11px;
+  color: var(--ink-muted);
+  font-weight: 500;
 }
 
 /* Field */
