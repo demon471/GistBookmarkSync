@@ -802,16 +802,76 @@ function importConfig() {
         syncFolderSelection.value = config.syncFolderSelection
         selectedFolderIds.value = new Set(config.syncFolderSelection)
       }
-      if (typeof config.syncIntervalMinutes === 'number') {
+      const storagePayload: Record<string, unknown> = {}
+      if (config.syncProvider === 'webdav' || config.syncProvider === 'gist')
+        storagePayload['sync-provider'] = config.syncProvider
+      if (config.githubToken)
+        storagePayload['github-token'] = config.githubToken
+      if (config.gistId)
+        storagePayload['gist-id'] = config.gistId
+      if (config.gistFileName)
+        storagePayload['gist-file-name'] = config.gistFileName
+      if (config.webdavUrl)
+        storagePayload['webdav-url'] = config.webdavUrl
+      if (config.webdavUsername)
+        storagePayload['webdav-username'] = config.webdavUsername
+      if (config.webdavPassword)
+        storagePayload['webdav-password'] = config.webdavPassword
+      if (typeof config.syncIntervalMinutes === 'number')
+        storagePayload['sync-interval-minutes'] = config.syncIntervalMinutes
+      if (Array.isArray(config.syncFolderSelection))
+        storagePayload['sync-folder-selection'] = config.syncFolderSelection
+      if (Object.keys(storagePayload).length > 0)
+        await browser.storage.local.set(storagePayload)
+      if (typeof config.syncIntervalMinutes === 'number')
         void safeSendMessage('refresh-sync-interval', { minutes: config.syncIntervalMinutes }, 'background')
-      }
-      showToast('配置已导入', 'success')
+      await handleImportSyncFlow()
     }
     catch {
       showToast('配置文件格式错误', 'error')
     }
   }
   input.click()
+}
+
+function collectAllFolderIds(nodes: FolderNode[]): string[] {
+  const result: string[] = []
+  const stack = [...nodes]
+  while (stack.length > 0) {
+    const node = stack.pop()
+    if (!node)
+      continue
+    result.push(node.id)
+    if (node.children?.length)
+      stack.push(...node.children)
+  }
+  return result
+}
+
+async function handleImportSyncFlow() {
+  if (syncProvider.value === 'webdav') {
+    if (!webdavUrl.value?.trim()) {
+      showToast('配置已导入', 'success')
+      return
+    }
+  }
+  else if (!githubToken.value?.trim() || !gistId.value?.trim() || !gistFileName.value?.trim()) {
+    showToast('配置已导入', 'success')
+    return
+  }
+
+  await downloadBookmarks({ silent: true })
+  if (syncProvider.value === 'webdav')
+    void checkWebdavConnection(true)
+  else
+    void checkConnection(true)
+  await loadFolderTree()
+  const allIds = collectAllFolderIds(folderTree.value)
+  selectedFolderIds.value = new Set(allIds)
+  syncFolderSelection.value = allIds
+  savedFolderIds.value = new Set(allIds)
+  await browser.storage.local.set({ 'sync-folder-selection': allIds })
+  showToast('配置已导入并刷新同步范围', 'success')
 }
 
 function showExportModal() {
@@ -1128,7 +1188,7 @@ watch(intervalDropdownOpen, (open) => {
           <input v-model="gistFileName" placeholder="bookmarks" class="input">
         </div>
         <div class="field">
-          <label class="field__label" @dblclick="openSyncLog">
+          <label class="field__label">
             <ph-timer class="field__icon" />
             自动拉取间隔
             <button class="link-ghost" type="button" @click.stop="openSyncLog">
@@ -1203,7 +1263,7 @@ watch(intervalDropdownOpen, (open) => {
           <input v-model="webdavPassword" type="password" placeholder="可选" class="input">
         </div>
         <div class="field">
-          <label class="field__label" @dblclick="openSyncLog">
+          <label class="field__label">
             <ph-timer class="field__icon" />
             自动拉取间隔
             <button class="link-ghost" type="button" @click.stop="openSyncLog">
@@ -1268,7 +1328,7 @@ watch(intervalDropdownOpen, (open) => {
           <span class="action-tile__icon"><ph-download-simple /></span>
           <span class="action-tile__label">导入配置</span>
         </button>
-        <button class="action-tile action-tile--green" @click="exportConfig">
+        <button class="action-tile action-tile--green" :disabled="!githubToken?.trim() && !webdavUrl?.trim()" @click="exportConfig">
           <span class="action-tile__icon"><ph-upload-simple /></span>
           <span class="action-tile__label">导出配置</span>
         </button>
@@ -1579,6 +1639,7 @@ watch(intervalDropdownOpen, (open) => {
   --danger: #dc3545;
   --danger-soft: rgba(220, 53, 69, 0.12);
 
+  height: 100vh;
   min-height: 100vh;
   padding: 18px 16px 28px;
   background:
@@ -1589,7 +1650,21 @@ watch(intervalDropdownOpen, (open) => {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  overflow: visible;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.panel::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+:global(html),
+:global(body),
+:global(#app) {
+  height: 100%;
+  overflow: hidden;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -1621,7 +1696,7 @@ watch(intervalDropdownOpen, (open) => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding-bottom: 6px;
+  padding-bottom: 4px;
 }
 
 .panel__brand {
@@ -1631,22 +1706,22 @@ watch(intervalDropdownOpen, (open) => {
 }
 
 .panel__logo {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
   background: linear-gradient(135deg, var(--accent) 0%, #ff8a6a 100%);
   display: grid;
   place-items: center;
-  box-shadow: 0 3px 10px rgba(232, 93, 59, 0.3);
+  box-shadow: 0 3px 8px rgba(232, 93, 59, 0.25);
 }
 
 .panel__logo-icon {
-  font-size: 18px;
+  font-size: 16px;
   color: white;
 }
 
 .panel__title {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 700;
   margin: 0;
   letter-spacing: -0.02em;
@@ -1654,7 +1729,7 @@ watch(intervalDropdownOpen, (open) => {
 }
 
 .panel__subtitle {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--ink-muted);
   margin: 2px 0 0;
 }
@@ -1663,9 +1738,9 @@ watch(intervalDropdownOpen, (open) => {
   display: flex;
   align-items: center;
   gap: 5px;
-  padding: 5px 10px;
+  padding: 4px 9px;
   border-radius: 16px;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 500;
   background: var(--bg-glass);
   border: 1px solid var(--card-border);
@@ -2026,14 +2101,17 @@ watch(intervalDropdownOpen, (open) => {
   color: var(--accent);
   font-size: 11px;
   cursor: pointer;
-  padding: 2px 4px;
+  padding: 0;
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  font-weight: 600;
+  text-decoration: none;
 }
 
 .link-ghost:hover {
-  text-decoration: underline;
+  text-decoration: none;
+  color: var(--accent);
 }
 
 .field__icon {
@@ -2091,6 +2169,13 @@ select.input optgroup {
   gap: 8px;
   width: 100%;
   cursor: pointer;
+}
+
+.select-input__trigger:focus,
+.select-input__trigger:focus-visible,
+.select-input__trigger:active {
+  box-shadow: none;
+  border-color: var(--input-border);
 }
 
 .select-input__value {
@@ -2343,18 +2428,18 @@ select.input optgroup {
 .action-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 8px;
+  gap: 6px;
 }
 
 .action-tile {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
-  border-radius: 11px;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 9px;
   border: none;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   color: white;
   transition: transform 0.15s, box-shadow 0.15s, opacity 0.15s;
@@ -2374,13 +2459,13 @@ select.input optgroup {
 }
 
 .action-tile__icon {
-  width: 26px;
-  height: 26px;
-  border-radius: 7px;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
   background: rgba(255, 255, 255, 0.2);
   display: grid;
   place-items: center;
-  font-size: 14px;
+  font-size: 12px;
   flex-shrink: 0;
 }
 
@@ -2425,10 +2510,9 @@ select.input optgroup {
   align-items: center;
   gap: 5px;
   margin: 0;
-  padding: 7px 10px;
-  border-radius: 7px;
+  padding: 6px 0;
+  border-radius: 0;
   font-size: 11px;
-  background: var(--input-bg);
   color: var(--ink-soft);
 }
 
@@ -2437,12 +2521,10 @@ select.input optgroup {
 }
 
 .message[data-state="ok"] {
-  background: var(--success-soft);
   color: var(--success);
 }
 
 .message[data-state="error"] {
-  background: var(--danger-soft);
   color: var(--danger);
 }
 
@@ -2627,7 +2709,7 @@ select.input optgroup {
 .modal {
   background: var(--card);
   border: 1px solid var(--card-border);
-  border-radius: 16px;
+  border-radius: 12px;
   width: 100%;
   max-width: 320px;
   overflow: hidden;
@@ -2638,17 +2720,17 @@ select.input optgroup {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 16px;
+  padding: 10px 14px;
   border-bottom: 1px solid var(--card-border);
 }
 
 .modal__icon {
-  font-size: 18px;
+  font-size: 16px;
   color: var(--accent);
 }
 
 .modal__title {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   margin: 0;
   color: var(--ink);
@@ -2665,7 +2747,7 @@ select.input optgroup {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  padding: 12px 16px;
+  padding: 8px 12px;
   border-top: 1px solid var(--card-border);
   background: var(--input-bg);
 }

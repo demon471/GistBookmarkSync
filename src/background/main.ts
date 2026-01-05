@@ -1158,6 +1158,18 @@ async function ensureLocalEntries(rootId: string, index: Map<string, LocalFolder
 
 async function clearLocalBookmarks(root: browser.bookmarks.BookmarkTreeNode, selectedSet?: Set<string>) {
   const selected = selectedSet || new Set<string>()
+  const clearAll = selected.size === 0
+  // eslint-disable-next-line no-console
+  console.log('[ClearBookmarks] start', { selectedCount: selected.size })
+
+  function countBookmarksInSubtree(node: browser.bookmarks.BookmarkTreeNode): number {
+    if (node.url)
+      return 1
+    let count = 0
+    for (const child of node.children || [])
+      count += countBookmarksInSubtree(child)
+    return count
+  }
 
   async function clearFolderContents(node: browser.bookmarks.BookmarkTreeNode, isSelected: boolean) {
     if (!node.children)
@@ -1165,8 +1177,27 @@ async function clearLocalBookmarks(root: browser.bookmarks.BookmarkTreeNode, sel
 
     for (const child of node.children) {
       if (child.url) {
-        if (isSelected)
+        if (isSelected || clearAll) {
+          try {
+            await browser.bookmarks.remove(child.id)
+          }
+          catch {
+            // eslint-disable-next-line no-console
+            console.warn('[ClearBookmarks] failed to remove bookmark', { id: child.id, title: child.title, url: child.url })
+          }
+        }
+        continue
+      }
+
+      if (clearAll) {
+        await clearFolderContents(child, true)
+        try {
           await browser.bookmarks.remove(child.id)
+        }
+        catch {
+          // eslint-disable-next-line no-console
+          console.warn('[ClearBookmarks] failed to remove folder', { id: child.id, title: child.title })
+        }
         continue
       }
 
@@ -1194,14 +1225,62 @@ async function clearLocalBookmarks(root: browser.bookmarks.BookmarkTreeNode, sel
     return false
   }
 
-  if (selected.size === 0) {
-    for (const rootFolder of root.children || [])
-      await clearFolderContents(rootFolder, true)
-    return
+  async function runClearPass() {
+    // Re-fetch fresh bookmark tree to ensure we're working with current data
+    const freshTree = await browser.bookmarks.getTree()
+    const freshRoot = freshTree[0]
+    if (!freshRoot)
+      return
+
+    if (selected.size === 0) {
+      for (const rootFolder of freshRoot.children || [])
+        await clearFolderContents(rootFolder, true)
+      return
+    }
+
+    for (const rootFolder of freshRoot.children || [])
+      await clearFolderContents(rootFolder, selected.has(rootFolder.id))
   }
 
-  for (const rootFolder of root.children || [])
-    await clearFolderContents(rootFolder, selected.has(rootFolder.id))
+  async function countBookmarksForSelectedFresh(): Promise<number> {
+    // Re-fetch fresh bookmark tree for accurate count
+    const freshTree = await browser.bookmarks.getTree()
+    const freshRoot = freshTree[0]
+    if (!freshRoot)
+      return 0
+
+    let count = 0
+    if (selected.size === 0) {
+      for (const rootFolder of freshRoot.children || [])
+        count += countBookmarksInSubtree(rootFolder)
+      return count
+    }
+    for (const id of selected) {
+      try {
+        const subtree = await browser.bookmarks.getSubTree(id)
+        const folder = subtree[0]
+        if (folder)
+          count += countBookmarksInSubtree(folder)
+      }
+      catch {
+        // ignore missing folders
+      }
+    }
+    return count
+  }
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    // eslint-disable-next-line no-console
+    console.log('[ClearBookmarks] pass', { attempt: attempt + 1 })
+    await runClearPass()
+    const remaining = await countBookmarksForSelectedFresh()
+    // eslint-disable-next-line no-console
+    console.log('[ClearBookmarks] remaining bookmarks', { remaining })
+    if (remaining === 0)
+      return
+  }
+  // eslint-disable-next-line no-console
+  console.warn('[ClearBookmarks] incomplete after retries')
 }
 
 // communication example: send previous tab title from background page
@@ -1951,6 +2030,12 @@ onMessage('sidepanel-visibility', ({ sender, data }) => {
 })
 
 onMessage('clear-bookmarks', async () => {
+  bookmarkEventSuspension += 1
+  if (autoSyncTimer) {
+    clearTimeout(autoSyncTimer)
+    autoSyncTimer = null
+  }
+  autoSyncPending = false
   try {
     const tree = await browser.bookmarks.getTree()
     const root = tree[0]
@@ -1966,6 +2051,9 @@ onMessage('clear-bookmarks', async () => {
   }
   catch (error) {
     return { ok: false, success: false, error: String(error) }
+  }
+  finally {
+    bookmarkEventSuspension = Math.max(0, bookmarkEventSuspension - 1)
   }
 })
 
