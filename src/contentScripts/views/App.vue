@@ -15,13 +15,15 @@ const containerRef = ref<HTMLDivElement | null>(null);
 const isDragging = ref(false);
 const isHoveringShortcut = ref(false);
 const isHoveringActions = ref(false);
+const isHoveringCloseBtn = ref(false);
 const isHovering = computed(
-  () => isHoveringShortcut.value || isHoveringActions.value,
+  () => isHoveringShortcut.value || isHoveringActions.value || isHoveringCloseBtn.value,
 );
 const isReady = ref(false);
 const pos = ref({ x: 0, y: 120, side: "right" as ShortcutPosition["side"] });
 const dragStart = ref({ x: 0, y: 0, pointerX: 0, pointerY: 0 });
 const hoverActivationWidth = 52;
+let hoverHideTimer: ReturnType<typeof setTimeout> | null = null;
 
 // 操作反馈状态
 const uploadState = ref<FeedbackState>("idle");
@@ -29,6 +31,9 @@ const downloadState = ref<FeedbackState>("idle");
 const clearState = ref<FeedbackState>("idle");
 const showClearHint = ref(false);
 let clearClickTimer: ReturnType<typeof setTimeout> | null = null;
+
+// 当前页面隐藏状态
+const isHiddenForPage = ref(false);
 
 const containerStyle = computed(() => ({
   left: `${pos.value.x}px`,
@@ -79,12 +84,27 @@ function snapToEdge(side?: ShortcutPosition["side"]) {
 
 function updateHoverByPointer(event: MouseEvent) {
   if (!containerRef.value) return;
+  cancelHoverHide();
   const rect = containerRef.value.getBoundingClientRect();
   const distance =
     pos.value.side === "right"
       ? rect.right - event.clientX
       : event.clientX - rect.left;
   isHoveringShortcut.value = distance <= hoverActivationWidth;
+}
+
+function delayedHoverHide() {
+  cancelHoverHide();
+  hoverHideTimer = setTimeout(() => {
+    isHoveringShortcut.value = false;
+  }, 150);
+}
+
+function cancelHoverHide() {
+  if (hoverHideTimer) {
+    clearTimeout(hoverHideTimer);
+    hoverHideTimer = null;
+  }
 }
 
 async function loadPosition() {
@@ -112,6 +132,30 @@ async function savePosition() {
       y: pos.value.y,
     };
     await browser.storage.local.set({ "shortcut-position": payload });
+  } catch {
+    // ignore storage failures
+  }
+}
+
+function getCurrentPageKey() {
+  return `hidden-page:${window.location.origin}${window.location.pathname}`;
+}
+
+async function loadHiddenState() {
+  try {
+    const key = getCurrentPageKey();
+    const stored = await browser.storage.local.get(key);
+    isHiddenForPage.value = !!stored[key];
+  } catch {
+    // ignore storage failures
+  }
+}
+
+async function hideForCurrentPage() {
+  try {
+    const key = getCurrentPageKey();
+    await browser.storage.local.set({ [key]: true });
+    isHiddenForPage.value = true;
   } catch {
     // ignore storage failures
   }
@@ -219,8 +263,11 @@ function onResize() {
 
 onMounted(() => {
   void (async () => {
-    await loadPosition();
-    isReady.value = true;
+    await loadHiddenState();
+    if (!isHiddenForPage.value) {
+      await loadPosition();
+      isReady.value = true;
+    }
   })();
   window.addEventListener("resize", onResize);
 });
@@ -232,6 +279,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div
+    v-if="!isHiddenForPage"
     ref="containerRef"
     class="shortcut"
     :class="[
@@ -241,16 +289,27 @@ onBeforeUnmount(() => {
     :style="containerStyle"
     @mouseenter="updateHoverByPointer"
     @mousemove="updateHoverByPointer"
-    @mouseleave="isHoveringShortcut = false"
+    @mouseleave="delayedHoverHide"
   >
-    <!-- 常驻按钮组 -->
+    <!-- 关闭按钮（悬浮时显示） -->
+    <button 
+      class="close-btn" 
+      @click.stop="hideForCurrentPage"
+      @mouseenter="isHoveringCloseBtn = true; cancelHoverHide()"
+      @mouseleave="isHoveringCloseBtn = false; delayedHoverHide()"
+    >
+      <ph-x class="close-icon" />
+    </button>
+    <!-- 侧边栏按钮（独立于主按钮） -->
+    <div class="sidebar-item">
+      <button class="sidebar-btn" @click="openSidePanel">
+        <ph-sidebar-simple class="sidebar-icon" />
+      </button>
+      <span class="sidebar-label">打开侧边栏</span>
+    </div>
+
+    <!-- 常驻主按钮 -->
     <div class="main-buttons">
-      <div class="sidebar-item">
-        <button class="sidebar-btn" @click="openSidePanel">
-          <ph-sidebar-simple class="sidebar-icon" />
-        </button>
-        <span class="sidebar-label">打开侧边栏</span>
-      </div>
       <button
         class="shortcut-btn"
         @pointerdown="onPointerDown"
@@ -326,10 +385,96 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
-  font-family: "Space Grotesk", "Noto Sans", "Segoe UI", sans-serif;
+  gap: 10px;
+  font-family: "Inter", "SF Pro Display", "Noto Sans SC", system-ui, sans-serif;
   user-select: none;
-  transition: opacity 200ms ease;
+  transition: opacity 250ms cubic-bezier(0.4, 0, 0.2, 1);
+  filter: drop-shadow(0 8px 32px rgba(0, 0, 0, 0.12)) drop-shadow(0 2px 8px rgba(0, 0, 0, 0.08));
+  
+  /* 现代化配色变量 */
+  --glass-bg: rgba(255, 255, 255, 0.88);
+  --glass-bg-soft: rgba(255, 255, 255, 0.65);
+  --glass-border: rgba(255, 255, 255, 0.5);
+  --glass-border-outer: rgba(0, 0, 0, 0.06);
+  --label-bg: linear-gradient(135deg, rgba(30, 30, 35, 0.95), rgba(20, 20, 25, 0.98));
+  --label-text: #f8fafc;
+  --accent: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  --accent-solid: #667eea;
+  --danger: #ef4444;
+  --danger-soft: rgba(239, 68, 68, 0.12);
+  --success: #10b981;
+  --success-soft: rgba(16, 185, 129, 0.12);
+  
+  /* 阴影层次 */
+  --shadow-elev: 0 20px 40px rgba(0, 0, 0, 0.12), 0 8px 16px rgba(0, 0, 0, 0.08);
+  --shadow-soft: 0 4px 12px rgba(0, 0, 0, 0.08), 0 2px 4px rgba(0, 0, 0, 0.04);
+  --shadow-glow: 0 0 20px rgba(102, 126, 234, 0.15);
+  
+  /* 按钮样式 */
+  --btn-bg: rgba(0, 0, 0, 0.04);
+  --btn-border: rgba(0, 0, 0, 0.08);
+  --btn-solid: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+  --btn-solid-hover: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+  --btn-solid-loading: linear-gradient(180deg, #eef2ff 0%, #e0e7ff 100%);
+  --btn-solid-success: linear-gradient(180deg, #d1fae5 0%, #a7f3d0 100%);
+  --btn-solid-error: linear-gradient(180deg, #fee2e2 0%, #fecaca 100%);
+  --btn-solid-danger: linear-gradient(180deg, #fee2e2 0%, #fecaca 100%);
+}
+
+/* 关闭按钮 */
+.close-btn {
+  position: absolute;
+  top: 65px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(166, 166, 167, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  box-shadow: 0 1px 3px rgba(69, 69, 69, 0.1);
+  cursor: pointer;
+  opacity: 0;
+  transform: scale(0.8);
+  transition: 
+    opacity 200ms ease, 
+    transform 250ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    background 200ms ease,
+    box-shadow 200ms ease;
+  z-index: 9999;
+}
+
+.shortcut.side-right .close-btn {
+  left: -30px
+}
+
+.shortcut.side-left .close-btn {
+  right: -30px;
+}
+
+.close-icon {
+  font-size: 9px;
+  color: rgba(255, 255, 255, 0.85);
+  transition: color 200ms ease, transform 200ms ease;
+  display: block;
+}
+
+.shortcut.is-hover .close-btn {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.close-btn:hover {
+  background: rgba(220, 60, 60, 0.9);
+  transform: scale(1.15);
+  box-shadow: 0 3px 10px rgba(220, 60, 60, 0.4);
+}
+
+.close-btn:hover .close-icon {
+  color: #fff;
+  transform: scale(1.1);
 }
 
 .shortcut.is-loading {
@@ -355,26 +500,35 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   position: relative;
+  transition: transform 380ms cubic-bezier(0.22, 0.8, 0.25, 1);
 }
 
 .shortcut-btn {
-  width: 34px;
-  height: 34px;
+  width: 32px;
+  height: 32px;
   border-radius: 999px;
-  border: 1px solid rgba(0, 0, 0, 0.08);
-  background: rgba(255, 255, 255, 0.7);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
+  border: none;
+  background: linear-gradient(145deg, #ffffff, #f1f5f9);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
   color: #333;
   display: grid;
   place-items: center;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  box-shadow: 
+    0 3px 16px rgba(0, 0, 0, 0.14),
+    0 1px 6px rgba(0, 0, 0, 0.1),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9);
   cursor: pointer;
-  transition: transform 280ms ease, opacity 280ms ease, filter 280ms ease, border-radius 280ms ease, border-color 280ms ease;
-  opacity: 0.6;
-  filter: grayscale(0.2);
+  transition: 
+    transform 350ms cubic-bezier(0.34, 1.56, 0.64, 1), 
+    opacity 300ms ease, 
+    filter 300ms ease, 
+    border-radius 300ms ease, 
+    box-shadow 300ms ease;
+  opacity: 0.5;
+  filter: grayscale(0.1);
   touch-action: none;
   position: relative;
   z-index: 2;
@@ -408,15 +562,15 @@ onBeforeUnmount(() => {
   top: -1px;
   bottom: -1px;
   left: -1px;
-  right: -16px;
-  background: rgba(255, 255, 255, 0.7);
+  right: -28px;
+  background: linear-gradient(150deg, var(--glass-bg), var(--glass-bg-soft));
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-  border: 1px solid rgba(0, 0, 0, 0.08);
+  border: 1px solid var(--glass-border);
   border-top-left-radius: 999px;
   border-bottom-left-radius: 999px;
-  border-top-right-radius: 0;
-  border-bottom-right-radius: 0;
+  border-top-right-radius: 8px;
+  border-bottom-right-radius: 8px;
   z-index: -1;
   opacity: 1;
   transition: opacity 280ms ease;
@@ -429,15 +583,15 @@ onBeforeUnmount(() => {
   top: -1px;
   bottom: -1px;
   right: -1px;
-  left: -16px;
-  background: rgba(255, 255, 255, 0.7);
+  left: -28px;
+  background: linear-gradient(150deg, var(--glass-bg), var(--glass-bg-soft));
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-  border: 1px solid rgba(0, 0, 0, 0.08);
+  border: 1px solid var(--glass-border);
   border-top-right-radius: 999px;
   border-bottom-right-radius: 999px;
-  border-top-left-radius: 0;
-  border-bottom-left-radius: 0;
+  border-top-left-radius: 8px;
+  border-bottom-left-radius: 8px;
   z-index: -1;
   opacity: 1;
   transition: opacity 280ms ease;
@@ -449,19 +603,34 @@ onBeforeUnmount(() => {
   transition: none;
 }
 
-.sidebar-btn {
-  width: 28px;
-  height: 28px;
-  border-radius: 10px;
+/* 贴边时用单一背景块，避免拼接感 */
+.shortcut.side-right:not(.is-dragging) .shortcut-btn,
+.shortcut.side-left:not(.is-dragging) .shortcut-btn {
+  background: transparent;
   border: none;
-  background: rgba(0, 0, 0, 0.06);
+  box-shadow: none;
+}
+
+.sidebar-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  border: none;
+  background: linear-gradient(145deg, #ffffff, #f1f5f9);
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 6px 12px rgba(9, 20, 18, 0.1);
+  box-shadow: 
+    0 2px 10px rgba(0, 0, 0, 0.11),
+    0 1px 3px rgba(0, 0, 0, 0.08),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9);
   cursor: pointer;
-  transition: transform 280ms ease, opacity 280ms ease, background 280ms ease;
-  opacity: 0.5;
+  transition: 
+    transform 350ms cubic-bezier(0.34, 1.56, 0.64, 1), 
+    opacity 300ms ease, 
+    background 300ms ease,
+    box-shadow 300ms ease;
+  opacity: 0.6;
 }
 
 .sidebar-item {
@@ -471,16 +640,24 @@ onBeforeUnmount(() => {
 }
 
 .sidebar-label {
-  font-size: 12px;
-  color: #fff;
-  padding: 2px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--label-text);
+  padding: 6px 12px;
   border-radius: 8px;
-  background: #1c1c1c;
+  background: var(--label-bg);
+  box-shadow: 
+    0 8px 24px rgba(0, 0, 0, 0.2),
+    0 2px 8px rgba(0, 0, 0, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
   white-space: nowrap;
   pointer-events: none;
   opacity: 0;
-  transform: translateY(2px);
-  transition: opacity 150ms ease, transform 150ms ease;
+  transform: translateY(4px) scale(0.95);
+  transition: 
+    opacity 200ms cubic-bezier(0.4, 0, 0.2, 1), 
+    transform 200ms cubic-bezier(0.34, 1.56, 0.64, 1);
   position: absolute;
 }
 
@@ -500,9 +677,10 @@ onBeforeUnmount(() => {
 }
 
 .sidebar-icon {
-  font-size: 16px;
-  color: #555;
+  font-size: 14px;
+  color: #64748b;
   display: block;
+  transition: color 200ms ease, transform 200ms ease;
 }
 
 .shortcut.is-hover .shortcut-btn,
@@ -524,45 +702,76 @@ onBeforeUnmount(() => {
 }
 
 .sidebar-btn:hover {
-  background: rgba(0, 0, 0, 0.12);
-  transform: scale(1.05);
+  background: linear-gradient(145deg, rgba(255, 255, 255, 1), rgba(248, 250, 252, 0.95));
+  transform: scale(1.08);
+  box-shadow: 
+    0 8px 20px rgba(0, 0, 0, 0.12),
+    0 2px 8px rgba(0, 0, 0, 0.08),
+    inset 0 1px 1px rgba(255, 255, 255, 1),
+    0 0 0 3px rgba(102, 126, 234, 0.1);
 }
 
 .sidebar-btn:hover .sidebar-icon {
-  color: #333;
+  color: var(--accent-solid);
+  transform: scale(1.05);
 }
 
 .shortcut.is-hover.side-right .main-buttons {
-  transform: translateX(-6px);
+  transform: translateX(-12px);
 }
 
 .shortcut.is-hover.side-left .main-buttons {
-  transform: translateX(6px);
+  transform: translateX(12px);
+}
+
+/* 侧边栏按钮独立移动，只移动一小段距离 */
+.shortcut.is-hover.side-right .sidebar-item {
+  transform: translateX(-4px);
+}
+
+.shortcut.is-hover.side-left .sidebar-item {
+  transform: translateX(4px);
+}
+
+.sidebar-item {
+  transition: transform 380ms cubic-bezier(0.22, 0.8, 0.25, 1);
 }
 
 .icon {
-  font-size: 16px;
-  color: #b7bcbc;
+  font-size: 14px;
+  color: #94a3b8;
   pointer-events: none;
+  transition: color 200ms ease, transform 200ms ease;
 }
 
 .icon-logo {
-  width: 20px;
-  height: 20px;
+  width: 16px;
+  height: 16px;
   display: block;
   object-fit: contain;
+  object-position: center;
+  margin: 0 auto;
   pointer-events: none;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.12));
+}
+
+.shortcut.side-right:not(.is-dragging) .icon-logo {
+  transform: translateX(3px);
+}
+
+.shortcut.side-left:not(.is-dragging) .icon-logo {
+  transform: translateX(-3px);
 }
 
 /* 悬浮操作按钮 */
 .actions {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   opacity: 0;
   visibility: hidden;
   transform: translateY(-8px) scale(0.95);
-  transition: opacity 250ms ease, transform 300ms cubic-bezier(0.34, 1.56, 0.64, 1), visibility 0ms 250ms;
+  transition: opacity 320ms ease, transform 420ms cubic-bezier(0.22, 0.8, 0.25, 1), visibility 0ms 320ms;
   pointer-events: none;
 }
 
@@ -587,16 +796,24 @@ onBeforeUnmount(() => {
 }
 
 .action-label {
-  font-size: 12px;
-  color: #fff;
-  padding: 2px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--label-text);
+  padding: 6px 12px;
   border-radius: 8px;
-  background: #1c1c1c;
+  background: var(--label-bg);
+  box-shadow: 
+    0 8px 24px rgba(0, 0, 0, 0.2),
+    0 2px 8px rgba(0, 0, 0, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
   white-space: nowrap;
   pointer-events: none;
   opacity: 0;
-  transform: translateY(2px);
-  transition: opacity 80ms ease, transform 80ms ease;
+  transform: translateY(4px) scale(0.95);
+  transition: 
+    opacity 150ms cubic-bezier(0.4, 0, 0.2, 1), 
+    transform 150ms cubic-bezier(0.34, 1.56, 0.64, 1);
   position: absolute;
 }
 
@@ -617,15 +834,25 @@ onBeforeUnmount(() => {
 
 .action-label.hint-visible {
   opacity: 1;
-  transform: translateY(0);
-  background: #dc3545;
+  transform: translateY(0) scale(1);
+  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
   color: #fff;
-  animation: pulse 0.5s ease-in-out infinite alternate;
+  box-shadow: 
+    0 8px 24px rgba(239, 68, 68, 0.35),
+    0 2px 8px rgba(239, 68, 68, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  animation: pulse-danger 1.2s ease-in-out infinite;
 }
 
-@keyframes pulse {
-  from { opacity: 0.8; }
-  to { opacity: 1; }
+@keyframes pulse-danger {
+  0%, 100% { 
+    opacity: 1; 
+    transform: translateY(0) scale(1);
+  }
+  50% { 
+    opacity: 0.9; 
+    transform: translateY(0) scale(1.02);
+  }
 }
 
 .shortcut.is-hover .actions,
@@ -634,7 +861,7 @@ onBeforeUnmount(() => {
   visibility: visible;
   transform: translateY(4px) scale(1);
   pointer-events: auto;
-  transition: opacity 250ms ease, transform 300ms cubic-bezier(0.34, 1.56, 0.64, 1), visibility 0ms;
+  transition: opacity 320ms ease, transform 420ms cubic-bezier(0.22, 0.8, 0.25, 1), visibility 0ms;
 }
 
 /* 拖动时隐藏操作按钮 */
@@ -660,24 +887,34 @@ onBeforeUnmount(() => {
   height: 28px;
   border-radius: 10px;
   border: none;
-  background: rgba(0, 0, 0, 0.06);
-  color: #1c1c1c;
+  background: linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%);
+  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  color: #1e293b;
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 4px 12px rgba(10, 22, 20, 0.08);
+  box-shadow: 
+    0 3px 12px rgba(0, 0, 0, 0.11),
+    0 1px 4px rgba(0, 0, 0, 0.08),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9);
   cursor: pointer;
   opacity: 0;
-  transform: translateY(8px);
-  transition: transform 280ms ease, opacity 200ms ease, box-shadow 280ms ease, background 280ms ease;
+  transform: translateY(10px) scale(0.9);
+  transition: 
+    transform 400ms cubic-bezier(0.34, 1.56, 0.64, 1), 
+    opacity 250ms ease, 
+    box-shadow 300ms ease, 
+    background 300ms ease;
 }
 
 .action-btn .icon {
   display: block;
-  width: 16px;
-  height: 16px;
+  width: 15px;
+  height: 15px;
   flex-shrink: 0;
-  color: #555;
+  color: #475569;
+  transition: color 200ms ease, transform 250ms cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 .action-btn:disabled {
@@ -686,35 +923,35 @@ onBeforeUnmount(() => {
 }
 
 .action-btn.danger {
-  background: #fce8e8;
+  background: linear-gradient(180deg, #fef2f2 0%, #fee2e2 100%);
 }
 
 .action-btn.danger .icon {
-  color: #d64545;
+  color: var(--danger);
 }
 
 .action-btn.state-loading {
-  background: #f0f4ff;
+  background: var(--btn-solid-loading);
 }
 
 .action-btn.state-success {
-  background: #e8f5e9;
+  background: var(--btn-solid-success);
 }
 
 .action-btn.state-success .icon {
-  color: #4caf50;
+  color: #2f9f5d;
 }
 
 .action-btn.state-error {
-  background: #ffebee;
+  background: var(--btn-solid-error);
 }
 
 .action-btn.state-error .icon {
-  color: #f44336;
+  color: var(--danger);
 }
 
 .spin {
-  animation: spin 1s linear infinite;
+  animation: spin 0.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
 }
 
 @keyframes spin {
@@ -725,7 +962,7 @@ onBeforeUnmount(() => {
 .shortcut.is-hover .action-btn,
 .shortcut.is-dragging .action-btn {
   opacity: 1;
-  transform: translateY(0);
+  transform: translateY(0) scale(1);
 }
 
 .shortcut.is-hover .action-item:nth-child(1) .action-btn {
@@ -741,23 +978,51 @@ onBeforeUnmount(() => {
 }
 
 .action-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
-  background: rgba(0, 0, 0, 0.12);
+  transform: translateY(-2px) scale(1.05);
+  background: var(--btn-solid-hover);
+  box-shadow: 
+    0 12px 24px rgba(0, 0, 0, 0.12),
+    0 4px 8px rgba(0, 0, 0, 0.08),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9),
+    0 0 0 3px rgba(102, 126, 234, 0.08);
 }
 
 .action-btn:hover:not(:disabled) .icon {
-  color: #333;
+  color: var(--accent-solid);
+  transform: scale(1.1);
 }
 
 .action-btn.danger:hover:not(:disabled) {
-  background: #f8d5d5;
+  background: linear-gradient(180deg, #fee2e2 0%, #fecaca 100%);
+  box-shadow: 
+    0 12px 24px rgba(239, 68, 68, 0.15),
+    0 4px 8px rgba(239, 68, 68, 0.1),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9),
+    0 0 0 3px rgba(239, 68, 68, 0.1);
 }
 
 .action-btn.danger:hover:not(:disabled) .icon {
-  color: #c0392b;
+  color: #dc2626;
+  transform: scale(1.1);
 }
 
 @media (prefers-color-scheme: dark) {
+  .shortcut {
+    --glass-bg: rgba(52, 52, 52, 0.85);
+    --glass-bg-soft: rgba(52, 52, 52, 0.6);
+    --glass-border: rgba(255, 255, 255, 0.12);
+    --label-bg: rgba(20, 20, 20, 0.92);
+    --label-text: #e9efee;
+    --btn-bg: rgba(255, 255, 255, 0.12);
+    --btn-border: rgba(255, 255, 255, 0.18);
+    --btn-solid: #2a2f33;
+    --btn-solid-hover: #343a3f;
+    --btn-solid-loading: #2a3346;
+    --btn-solid-success: #24352c;
+    --btn-solid-error: #3a2628;
+    --btn-solid-danger: #3c2427;
+  }
+
   .shortcut-btn {
     background: rgba(50, 50, 50, 0.8);
     border-color: rgba(255, 255, 255, 0.12);
@@ -775,15 +1040,23 @@ onBeforeUnmount(() => {
   }
 
   .sidebar-btn {
-    background: rgba(255, 255, 255, 0.1);
+    background: linear-gradient(145deg, #3f3f46, #27272a);
+    box-shadow: 
+      0 4px 16px rgba(0, 0, 0, 0.4),
+      0 2px 6px rgba(0, 0, 0, 0.3),
+      inset 0 1px 1px rgba(255, 255, 255, 0.1);
   }
 
   .sidebar-icon {
-    color: rgba(255, 255, 255, 0.6);
+    color: rgba(255, 255, 255, 0.7);
   }
 
   .sidebar-btn:hover {
-    background: rgba(255, 255, 255, 0.2);
+    background: linear-gradient(145deg, #52525b, #3f3f46);
+    box-shadow: 
+      0 6px 20px rgba(0, 0, 0, 0.5),
+      0 2px 8px rgba(0, 0, 0, 0.4),
+      inset 0 1px 1px rgba(255, 255, 255, 0.15);
   }
 
   .sidebar-btn:hover .sidebar-icon {
@@ -791,16 +1064,23 @@ onBeforeUnmount(() => {
   }
 
   .action-btn {
-    background: rgba(255, 255, 255, 0.1);
-    box-shadow: 0 10px 18px rgba(0, 0, 0, 0.5);
+    background: linear-gradient(180deg, #3f3f46 0%, #27272a 100%);
+    box-shadow: 
+      0 4px 16px rgba(0, 0, 0, 0.4),
+      0 2px 6px rgba(0, 0, 0, 0.3),
+      inset 0 1px 1px rgba(255, 255, 255, 0.08);
   }
 
   .action-btn .icon {
-    color: rgba(255, 255, 255, 0.6);
+    color: rgba(255, 255, 255, 0.7);
   }
 
   .action-btn:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.2);
+    background: linear-gradient(180deg, #52525b 0%, #3f3f46 100%);
+    box-shadow: 
+      0 8px 24px rgba(0, 0, 0, 0.5),
+      0 4px 10px rgba(0, 0, 0, 0.4),
+      inset 0 1px 1px rgba(255, 255, 255, 0.12);
   }
 
   .action-btn:hover:not(:disabled) .icon {
@@ -808,44 +1088,48 @@ onBeforeUnmount(() => {
   }
 
   .action-btn.danger {
-    background: #2d2424;
+    background: linear-gradient(180deg, #451a1a 0%, #2d1515 100%);
   }
 
   .action-btn.danger .icon {
-    color: #e57373;
+    color: #f87171;
   }
 
   .action-btn.danger:hover:not(:disabled) {
-    background: #3d2e2e;
+    background: linear-gradient(180deg, #5c2424 0%, #451a1a 100%);
   }
 
   .action-btn.state-loading {
-    background: #1f2333;
+    background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
   }
 
   .action-btn.state-success {
-    background: #1f2d1f;
+    background: linear-gradient(180deg, #14532d 0%, #052e16 100%);
   }
 
   .action-btn.state-success .icon {
-    color: #66bb6a;
+    color: #4ade80;
   }
 
   .action-btn.state-error {
-    background: #2d1f1f;
+    background: linear-gradient(180deg, #450a0a 0%, #2d0a0a 100%);
   }
 
   .action-btn.state-error .icon {
-    color: #ef5350;
+    color: #f87171;
   }
 
   .icon {
-    color: #cfd6d5;
+    color: #d4d4d8;
   }
 
   .action-label {
-    color: #d6dfdd;
-    background: #1c1c1c;
+    color: #e4e4e7;
+    background: linear-gradient(135deg, #27272a 0%, #18181b 100%);
+    box-shadow: 
+      0 8px 24px rgba(0, 0, 0, 0.5),
+      0 2px 8px rgba(0, 0, 0, 0.4),
+      inset 0 1px 0 rgba(255, 255, 255, 0.08);
   }
 
   .confirm-dialog {
@@ -867,6 +1151,24 @@ onBeforeUnmount(() => {
 
   .confirm-btn.cancel:hover {
     background: #444;
+  }
+
+  /* 关闭按钮暗黑模式 */
+  .close-btn {
+    background: rgba(60, 60, 70, 0.7);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+  }
+
+  .close-icon {
+    color: rgba(255, 255, 255, 0.7);
+  }
+
+  .close-btn:hover {
+    background: rgba(180, 80, 80, 0.85);
+  }
+
+  .close-btn:hover .close-icon {
+    color: #fff;
   }
 }
 </style>
