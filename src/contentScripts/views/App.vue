@@ -35,6 +35,11 @@ let clearClickTimer: ReturnType<typeof setTimeout> | null = null;
 // 当前页面隐藏状态
 const isHiddenForPage = ref(false);
 
+// 页面暗黑模式检测
+const isDarkMode = ref(false);
+let darkModeObserver: MutationObserver | null = null;
+let darkModeMediaQuery: MediaQueryList | null = null;
+
 const containerStyle = computed(() => ({
   left: `${pos.value.x}px`,
   top: `${pos.value.y}px`,
@@ -138,7 +143,8 @@ async function savePosition() {
 }
 
 function getCurrentPageKey() {
-  return `hidden-page:${window.location.origin}${window.location.pathname}`;
+  // 使用域名/IP 作为存储键，不包含路径
+  return `hidden-host:${window.location.hostname}`;
 }
 
 async function loadHiddenState() {
@@ -261,6 +267,83 @@ function onResize() {
   snapToEdge(pos.value.side);
 }
 
+function detectDarkMode() {
+  const html = document.documentElement;
+  const body = document.body;
+  
+  // 检测常见的暗黑模式类名和属性
+  const darkClasses = ['dark', 'dark-mode', 'theme-dark', 'night'];
+  const hasDarkClass = darkClasses.some(cls => 
+    html.classList.contains(cls) || body?.classList.contains(cls)
+  );
+  
+  // 检测 data-theme 属性
+  const dataTheme = html.getAttribute('data-theme') || body?.getAttribute('data-theme') || '';
+  const colorScheme = html.getAttribute('data-color-scheme') || body?.getAttribute('data-color-scheme') || '';
+  const hasDarkTheme = ['dark', 'night'].some(t => 
+    dataTheme.toLowerCase().includes(t) || colorScheme.toLowerCase().includes(t)
+  );
+  
+  // 检测 style 属性中的 color-scheme
+  const styleColorScheme = getComputedStyle(html).colorScheme || '';
+  const hasStyleDark = styleColorScheme.includes('dark');
+  
+  // 检测系统媒体查询
+  const prefersColorScheme = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  
+  // 检测背景色亮度
+  const bgColor = getComputedStyle(body || html).backgroundColor;
+  let isBackgroundDark = false;
+  if (bgColor && bgColor !== 'transparent' && bgColor !== 'rgba(0, 0, 0, 0)') {
+    const match = bgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    if (match) {
+      const [, r, g, b] = match.map(Number);
+      const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      isBackgroundDark = luminance < 0.5;
+    }
+  }
+  
+  // 综合判断：优先使用页面配置，其次是系统配置
+  isDarkMode.value = hasDarkClass || hasDarkTheme || hasStyleDark || isBackgroundDark || prefersColorScheme;
+}
+
+function setupDarkModeDetection() {
+  // 初始检测
+  detectDarkMode();
+  
+  // 监听 DOM 变化
+  darkModeObserver = new MutationObserver(() => {
+    detectDarkMode();
+  });
+  
+  darkModeObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['class', 'data-theme', 'data-color-scheme', 'style'],
+  });
+  
+  if (document.body) {
+    darkModeObserver.observe(document.body, {
+      attributes: true,
+      attributeFilter: ['class', 'data-theme', 'data-color-scheme', 'style'],
+    });
+  }
+  
+  // 监听系统主题变化
+  darkModeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+  darkModeMediaQuery.addEventListener('change', detectDarkMode);
+}
+
+function cleanupDarkModeDetection() {
+  if (darkModeObserver) {
+    darkModeObserver.disconnect();
+    darkModeObserver = null;
+  }
+  if (darkModeMediaQuery) {
+    darkModeMediaQuery.removeEventListener('change', detectDarkMode);
+    darkModeMediaQuery = null;
+  }
+}
+
 onMounted(() => {
   void (async () => {
     await loadHiddenState();
@@ -270,10 +353,12 @@ onMounted(() => {
     }
   })();
   window.addEventListener("resize", onResize);
+  setupDarkModeDetection();
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("resize", onResize);
+  cleanupDarkModeDetection();
 });
 </script>
 
@@ -283,7 +368,7 @@ onBeforeUnmount(() => {
     ref="containerRef"
     class="shortcut"
     :class="[
-      { 'is-dragging': isDragging, 'is-hover': isHovering, 'is-loading': !isReady },
+      { 'is-dragging': isDragging, 'is-hover': isHovering, 'is-loading': !isReady, 'is-dark': isDarkMode },
       `side-${pos.side}`,
     ]"
     :style="containerStyle"
@@ -1170,5 +1255,148 @@ onBeforeUnmount(() => {
   .close-btn:hover .close-icon {
     color: #fff;
   }
+}
+
+/* JS 检测的暗黑模式样式 */
+.shortcut.is-dark {
+  --glass-bg: rgba(52, 52, 52, 0.85);
+  --glass-bg-soft: rgba(52, 52, 52, 0.6);
+  --glass-border: rgba(255, 255, 255, 0.12);
+  --label-bg: rgba(20, 20, 20, 0.92);
+  --label-text: #e9efee;
+  --btn-bg: rgba(255, 255, 255, 0.12);
+  --btn-border: rgba(255, 255, 255, 0.18);
+  --btn-solid: #2a2f33;
+  --btn-solid-hover: #343a3f;
+  --btn-solid-loading: #2a3346;
+  --btn-solid-success: #24352c;
+  --btn-solid-error: #3a2628;
+  --btn-solid-danger: #3c2427;
+}
+
+.shortcut.is-dark .shortcut-btn {
+  background: rgba(50, 50, 50, 0.8);
+  border-color: rgba(255, 255, 255, 0.12);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.shortcut.is-dark.is-dragging .shortcut-btn {
+  border-color: rgba(255, 255, 255, 0.12) !important;
+}
+
+.shortcut.is-dark.side-right .shortcut-btn::before,
+.shortcut.is-dark.side-left .shortcut-btn::before {
+  background: rgba(50, 50, 50, 0.8);
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+.shortcut.is-dark .sidebar-btn {
+  background: linear-gradient(145deg, #3f3f46, #27272a);
+  box-shadow: 
+    0 4px 16px rgba(0, 0, 0, 0.4),
+    0 2px 6px rgba(0, 0, 0, 0.3),
+    inset 0 1px 1px rgba(255, 255, 255, 0.1);
+}
+
+.shortcut.is-dark .sidebar-icon {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.shortcut.is-dark .sidebar-btn:hover {
+  background: linear-gradient(145deg, #52525b, #3f3f46);
+  box-shadow: 
+    0 6px 20px rgba(0, 0, 0, 0.5),
+    0 2px 8px rgba(0, 0, 0, 0.4),
+    inset 0 1px 1px rgba(255, 255, 255, 0.15);
+}
+
+.shortcut.is-dark .sidebar-btn:hover .sidebar-icon {
+  color: #fff;
+}
+
+.shortcut.is-dark .action-btn {
+  background: linear-gradient(180deg, #3f3f46 0%, #27272a 100%);
+  box-shadow: 
+    0 4px 16px rgba(0, 0, 0, 0.4),
+    0 2px 6px rgba(0, 0, 0, 0.3),
+    inset 0 1px 1px rgba(255, 255, 255, 0.08);
+}
+
+.shortcut.is-dark .action-btn .icon {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.shortcut.is-dark .action-btn:hover:not(:disabled) {
+  background: linear-gradient(180deg, #52525b 0%, #3f3f46 100%);
+  box-shadow: 
+    0 8px 24px rgba(0, 0, 0, 0.5),
+    0 4px 10px rgba(0, 0, 0, 0.4),
+    inset 0 1px 1px rgba(255, 255, 255, 0.12);
+}
+
+.shortcut.is-dark .action-btn:hover:not(:disabled) .icon {
+  color: #fff;
+}
+
+.shortcut.is-dark .action-btn.danger {
+  background: linear-gradient(180deg, #451a1a 0%, #2d1515 100%);
+}
+
+.shortcut.is-dark .action-btn.danger .icon {
+  color: #f87171;
+}
+
+.shortcut.is-dark .action-btn.danger:hover:not(:disabled) {
+  background: linear-gradient(180deg, #5c2424 0%, #451a1a 100%);
+}
+
+.shortcut.is-dark .action-btn.state-loading {
+  background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
+}
+
+.shortcut.is-dark .action-btn.state-success {
+  background: linear-gradient(180deg, #14532d 0%, #052e16 100%);
+}
+
+.shortcut.is-dark .action-btn.state-success .icon {
+  color: #4ade80;
+}
+
+.shortcut.is-dark .action-btn.state-error {
+  background: linear-gradient(180deg, #450a0a 0%, #2d0a0a 100%);
+}
+
+.shortcut.is-dark .action-btn.state-error .icon {
+  color: #f87171;
+}
+
+.shortcut.is-dark .icon {
+  color: #d4d4d8;
+}
+
+.shortcut.is-dark .action-label {
+  color: #e4e4e7;
+  background: linear-gradient(135deg, #27272a 0%, #18181b 100%);
+  box-shadow: 
+    0 8px 24px rgba(0, 0, 0, 0.5),
+    0 2px 8px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.shortcut.is-dark .close-btn {
+  background: rgba(60, 60, 70, 0.7);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+
+.shortcut.is-dark .close-icon {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.shortcut.is-dark .close-btn:hover {
+  background: rgba(180, 80, 80, 0.85);
+}
+
+.shortcut.is-dark .close-btn:hover .close-icon {
+  color: #fff;
 }
 </style>

@@ -485,18 +485,29 @@ async function probeWebDavPath(url: string, username?: string, password?: string
 }
 
 async function ensureWebDavDirectory(url: string, username?: string, password?: string) {
-  let response = await probeWebDavPath(url, username, password)
+  let response: Response
+  try {
+    response = await probeWebDavPath(url, username, password)
+  }
+  catch {
+    return { ok: false, error: 'WebDAV 连接失败，请检查地址配置' }
+  }
 
   if (response.status === 401 || response.status === 403)
     return { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' }
 
   if (response.status === 404) {
-    response = await fetch(url, {
-      method: 'MKCOL',
-      headers: {
-        ...buildWebDavAuthHeaders(username, password),
-      },
-    })
+    try {
+      response = await fetch(url, {
+        method: 'MKCOL',
+        headers: {
+          ...buildWebDavAuthHeaders(username, password),
+        },
+      })
+    }
+    catch {
+      return { ok: false, error: 'WebDAV 目录创建失败，请检查地址配置' }
+    }
 
     if (response.status === 401 || response.status === 403)
       return { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' }
@@ -597,27 +608,38 @@ async function applyWebDavDownload(
 
 async function updateWebDavFile(url: string, username: string | undefined, password: string | undefined, nodes: SyncNode[]) {
   const payload = buildBookmarkPayloadText(nodes)
-  let response = await (async () => {
-    const compressed = await buildGzipRequestBody(payload)
-    return await fetch(url, {
-      method: 'PUT',
-      headers: {
-        ...compressed.headers,
-        ...buildWebDavAuthHeaders(username, password),
-      },
-      body: compressed.body,
-    })
-  })()
+  let response: Response
+  try {
+    response = await (async () => {
+      const compressed = await buildGzipRequestBody(payload)
+      return await fetch(url, {
+        method: 'PUT',
+        headers: {
+          ...compressed.headers,
+          ...buildWebDavAuthHeaders(username, password),
+        },
+        body: compressed.body,
+      })
+    })()
+  }
+  catch {
+    return { ok: false, error: 'WebDAV 推送失败，请检查地址配置' }
+  }
 
   if (!response.ok && response.status !== 401 && response.status !== 403 && response.status !== 404) {
-    response = await fetch(url, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        ...buildWebDavAuthHeaders(username, password),
-      },
-      body: payload,
-    })
+    try {
+      response = await fetch(url, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          ...buildWebDavAuthHeaders(username, password),
+        },
+        body: payload,
+      })
+    }
+    catch {
+      return { ok: false, error: 'WebDAV 推送失败，请检查地址配置' }
+    }
   }
 
   if (response.status === 401 || response.status === 403)

@@ -49,6 +49,8 @@ const webdavVersionsVisible = ref(false)
 const webdavVersionsState = ref<'idle' | 'loading' | 'error'>('idle')
 const webdavVersionsMessage = ref('')
 const webdavVersions = ref<Array<{ file: string, timestamp: string, count?: number }>>([])
+const showGithubToken = ref(false)
+const showWebdavPassword = ref(false)
 let downloadClickTimer: ReturnType<typeof setTimeout> | null = null
 const intervalDropdownOpen = ref(false)
 const intervalDropdownRef = ref<HTMLElement | null>(null)
@@ -61,8 +63,57 @@ const syncLogError = ref('')
 const exportModalVisible = ref(false)
 const exportIncludeExcluded = ref(true)
 
+// 隐藏页面列表
+const hiddenPagesVisible = ref(false)
+const hiddenPages = ref<Array<{ key: string, host: string }>>([])
+const hiddenPagesLoading = ref(false)
+const hiddenPagesSearch = ref('')
+const hiddenPagesPage = ref(1)
+const hiddenPagesPerPage = 10
+
+// WebDAV 协议选择
+const webdavProtocol = ref<'https' | 'http'>('https')
+const protocolDropdownOpen = ref(false)
+const protocolDropdownRef = ref<HTMLElement | null>(null)
+const protocolDropdownTriggerRef = ref<HTMLElement | null>(null)
+const protocolDropdownMenuRef = ref<HTMLElement | null>(null)
+const protocolDropdownStyle = ref<Record<string, string>>({})
+
+function stripWebdavProtocol(value: string) {
+  return value.replace(/^https?:\/\//, '')
+}
+
+function normalizeWebdavUrl(value: string, protocol: 'https' | 'http') {
+  const trimmed = value.trim()
+  if (!trimmed)
+    return ''
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://'))
+    return trimmed
+  return `${protocol}://${trimmed}`
+}
+
+// 协议选项
+const protocolOptions = [
+  { value: 'https', label: 'https://' },
+  { value: 'http', label: 'http://' },
+] as const
+
 const activeValidationState = computed(() => {
   return syncProvider.value === 'webdav' ? webdavValidationState.value : gistValidationState.value
+})
+
+const webdavHost = computed({
+  get() {
+    return stripWebdavProtocol(webdavUrl.value?.trim() || '')
+  },
+  set(value: string) {
+    webdavUrl.value = normalizeWebdavUrl(value, webdavProtocol.value)
+  },
+})
+
+// 完整的 WebDAV URL（协议 + 地址）
+const fullWebdavUrl = computed(() => {
+  return normalizeWebdavUrl(webdavUrl.value?.trim() || '', webdavProtocol.value)
 })
 
 const syncIntervalOptions = [
@@ -82,6 +133,10 @@ const providerTitle = computed(() => {
 
 const providerSubtitle = computed(() => {
   return syncProvider.value === 'webdav' ? '书签 WebDAV 同步' : '书签云同步'
+})
+
+const providerTransitionName = computed(() => {
+  return syncProvider.value === 'webdav' ? 'slide-right' : 'slide-left'
 })
 
 const syncIntervalLabel = computed(() => {
@@ -221,6 +276,69 @@ function handleIntervalScroll() {
     void positionIntervalDropdown()
 }
 
+// 协议下拉菜单控制
+function toggleProtocolDropdown() {
+  protocolDropdownOpen.value = !protocolDropdownOpen.value
+  if (protocolDropdownOpen.value)
+    void positionProtocolDropdown()
+}
+
+function selectProtocol(value: 'https' | 'http') {
+  webdavProtocol.value = value
+  const host = stripWebdavProtocol(webdavUrl.value?.trim() || '')
+  if (host)
+    webdavUrl.value = normalizeWebdavUrl(host, value)
+  protocolDropdownOpen.value = false
+}
+
+function handleProtocolDropdownOutside(event: MouseEvent) {
+  const target = event.target as Node | null
+  if (!protocolDropdownRef.value || !target)
+    return
+  if (!protocolDropdownRef.value.contains(target))
+    protocolDropdownOpen.value = false
+}
+
+function handleProtocolEsc(event: KeyboardEvent) {
+  if (event.key === 'Escape')
+    protocolDropdownOpen.value = false
+}
+
+async function positionProtocolDropdown() {
+  await nextTick()
+  const trigger = protocolDropdownTriggerRef.value
+  const menu = protocolDropdownMenuRef.value
+  if (!trigger || !menu) {
+    requestAnimationFrame(() => {
+      if (protocolDropdownOpen.value)
+        void positionProtocolDropdown()
+    })
+    return
+  }
+  const rect = trigger.getBoundingClientRect()
+  const viewportHeight = window.innerHeight
+  const menuHeight = Math.min(menu.scrollHeight, 120)
+  let top = rect.bottom + 4
+  if (top + menuHeight > viewportHeight - 8)
+    top = Math.max(8, rect.top - 4 - menuHeight)
+
+  protocolDropdownStyle.value = {
+    top: `${top}px`,
+    left: `${rect.left}px`,
+    minWidth: `${rect.width}px`,
+  }
+}
+
+function handleProtocolResize() {
+  if (protocolDropdownOpen.value)
+    void positionProtocolDropdown()
+}
+
+function handleProtocolScroll() {
+  if (protocolDropdownOpen.value)
+    void positionProtocolDropdown()
+}
+
 function setScrollLock(locked: boolean) {
   document.documentElement.style.overflow = locked ? 'hidden' : ''
   document.body.style.overflow = locked ? 'hidden' : ''
@@ -282,6 +400,18 @@ onMounted(() => {
     syncLogReady.value = true
   }, { immediate: true })
 })
+
+watch(
+  () => webdavUrl.value,
+  (value) => {
+    const trimmed = value?.trim() || ''
+    if (trimmed.startsWith('http://'))
+      webdavProtocol.value = 'http'
+    else if (trimmed.startsWith('https://'))
+      webdavProtocol.value = 'https'
+  },
+  { immediate: true },
+)
 
 onBeforeUnmount(() => {
   window.removeEventListener('pagehide', handleSidepanelHide)
@@ -454,15 +584,20 @@ async function validateGistAuth() {
       'background',
     )
 
+    // Log result
+    console.log('[Gist Validation Result]', result)
+
+    const res = result as any
+
     if (result.ok) {
       gistValidationState.value = 'ok'
       connectionStatus.value = 'ok'
       lastValidationTime.value = Date.now()
-      if (result.gist?.id)
-        gistId.value = result.gist.id
-      if (result.createdGist)
+      if (res.gist?.id)
+        gistId.value = res.gist.id
+      if (res.createdGist)
         showToast('已创建新 Gist 并保存配置', 'success')
-      else if (result.createdFile)
+      else if (res.createdFile)
         showToast('已创建文件并保存配置', 'success')
       else
         showToast('配置已保存', 'success')
@@ -472,12 +607,16 @@ async function validateGistAuth() {
     gistValidationState.value = 'error'
     connectionStatus.value = 'error'
     lastValidationTime.value = Date.now()
-    showToast(result.errors?.join('; ') || '保存失败', 'error')
+    
+    const context = res.errors?.join('; ') || '保存失败'
+    console.error('[Gist Validation Error]', context, result)
+    showToast(context, 'error')
   }
   catch (error) {
     gistValidationState.value = 'error'
     connectionStatus.value = 'error'
     lastValidationTime.value = Date.now()
+    console.error('[Gist Validation Exception]', error)
     showToast(error instanceof Error ? error.message : '保存失败', 'error')
   }
 }
@@ -517,7 +656,7 @@ async function checkWebdavConnection(force = false) {
     const result = await safeSendMessage(
       'validate-webdav-auth',
       {
-        url: webdavUrl.value,
+        url: fullWebdavUrl.value,
         username: webdavUsername.value,
         password: webdavPassword.value,
       },
@@ -545,12 +684,15 @@ async function validateWebdavAuth() {
     const result = await safeSendMessage(
       'validate-webdav-auth',
       {
-        url: webdavUrl.value,
+        url: fullWebdavUrl.value,
         username: webdavUsername.value,
         password: webdavPassword.value,
       },
       'background',
     )
+
+    // Log result
+    console.log('[WebDAV Validation Result]', result)
 
     if (result.ok) {
       webdavValidationState.value = 'ok'
@@ -565,14 +707,18 @@ async function validateWebdavAuth() {
 
     webdavValidationState.value = 'error'
     webdavConnectionStatus.value = 'error'
-    webdavLastValidationTime.value = Date.now()
-    showToast(result.errors?.join('; ') || '保存失败', 'error')
+    
+    // Enhanced error logging
+    const res = result as any
+    const errorDetail = res.error || res.message || (Array.isArray(res.errors) ? res.errors.join('; ') : '') || '未知错误'
+    console.error('[WebDAV Validation Error]', errorDetail, result)
+    showToast(`连接失败: ${errorDetail}`, 'error')
   }
-  catch (error) {
+  catch (err) {
     webdavValidationState.value = 'error'
     webdavConnectionStatus.value = 'error'
-    webdavLastValidationTime.value = Date.now()
-    showToast(error instanceof Error ? error.message : '保存失败', 'error')
+    console.error('[WebDAV Validation Exception]', err)
+    showToast(`连接校验发生异常: ${err instanceof Error ? err.message : String(err)}`, 'error')
   }
 }
 
@@ -750,16 +896,21 @@ function formatWebdavFileLabel(item: { file: string, seq?: number }) {
 }
 
 function exportConfig() {
+  // 提取隐藏的域名列表
+  const hiddenHosts = hiddenPages.value.map(p => p.host)
+  
   const config = {
     syncProvider: syncProvider.value,
     githubToken: githubToken.value,
     gistId: gistId.value,
     gistFileName: gistFileName.value,
-    webdavUrl: webdavUrl.value,
+    webdavUrl: webdavHost.value,
+    webdavProtocol: webdavProtocol.value,
     webdavUsername: webdavUsername.value,
     webdavPassword: webdavPassword.value,
     syncIntervalMinutes: syncIntervalMinutes.value,
     syncFolderSelection: Array.from(selectedFolderIds.value),
+    hiddenHosts,
   }
   const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
@@ -791,7 +942,13 @@ function importConfig() {
       if (config.gistFileName)
         gistFileName.value = config.gistFileName
       if (config.webdavUrl)
-        webdavUrl.value = config.webdavUrl
+        webdavUrl.value = normalizeWebdavUrl(config.webdavUrl, webdavProtocol.value)
+      if (config.webdavProtocol === 'http' || config.webdavProtocol === 'https') {
+        webdavProtocol.value = config.webdavProtocol
+        const host = stripWebdavProtocol(webdavUrl.value?.trim() || '')
+        if (host)
+          webdavUrl.value = normalizeWebdavUrl(host, webdavProtocol.value)
+      }
       if (config.webdavUsername)
         webdavUsername.value = config.webdavUsername
       if (config.webdavPassword)
@@ -812,7 +969,7 @@ function importConfig() {
       if (config.gistFileName)
         storagePayload['gist-file-name'] = config.gistFileName
       if (config.webdavUrl)
-        storagePayload['webdav-url'] = config.webdavUrl
+        storagePayload['webdav-url'] = normalizeWebdavUrl(config.webdavUrl, webdavProtocol.value)
       if (config.webdavUsername)
         storagePayload['webdav-username'] = config.webdavUsername
       if (config.webdavPassword)
@@ -821,10 +978,32 @@ function importConfig() {
         storagePayload['sync-interval-minutes'] = config.syncIntervalMinutes
       if (Array.isArray(config.syncFolderSelection))
         storagePayload['sync-folder-selection'] = config.syncFolderSelection
+      
+      // 导入隐藏的域名列表 - 合并模式，不会覆盖现有的
+      // browser.storage.local.set() 只会更新/添加 keys，不会删除其他 keys
+      let importedHiddenCount = 0
+      if (Array.isArray(config.hiddenHosts)) {
+        for (const host of config.hiddenHosts) {
+          if (typeof host === 'string' && host.trim()) {
+            storagePayload[`hidden-host:${host.trim()}`] = true
+            importedHiddenCount++
+          }
+        }
+      }
+      
       if (Object.keys(storagePayload).length > 0)
         await browser.storage.local.set(storagePayload)
       if (typeof config.syncIntervalMinutes === 'number')
         void safeSendMessage('refresh-sync-interval', { minutes: config.syncIntervalMinutes }, 'background')
+      
+      // 重新加载隐藏页面列表（会读取所有 hidden-host: 和 hidden-page: keys）
+      await loadHiddenPages()
+      
+      // 显示导入结果
+      if (importedHiddenCount > 0) {
+        showToast(`已合并 ${importedHiddenCount} 个隐藏域名`, 'success')
+      }
+      
       await handleImportSyncFlow()
     }
     catch {
@@ -937,6 +1116,91 @@ function importBookmarks() {
   }
   input.click()
 }
+
+// 隐藏页面管理
+async function loadHiddenPages() {
+  hiddenPagesLoading.value = true
+  try {
+    const stored = await browser.storage.local.get(null)
+    const pages: Array<{ key: string, host: string }> = []
+    for (const [key, value] of Object.entries(stored)) {
+      // 支持新格式 hidden-host: 和旧格式 hidden-page:
+      if (key.startsWith('hidden-host:') && value === true) {
+        const host = key.replace('hidden-host:', '')
+        pages.push({ key, host })
+      } else if (key.startsWith('hidden-page:') && value === true) {
+        // 旧格式：从完整 URL 中提取域名
+        try {
+          const url = new URL(key.replace('hidden-page:', ''))
+          pages.push({ key, host: url.hostname })
+        } catch {
+          // 如果解析失败，直接使用原值
+          const host = key.replace('hidden-page:', '')
+          pages.push({ key, host })
+        }
+      }
+    }
+    hiddenPages.value = pages
+  }
+  catch {
+    hiddenPages.value = []
+  }
+  finally {
+    hiddenPagesLoading.value = false
+  }
+}
+
+async function openHiddenPages() {
+  hiddenPagesVisible.value = true
+  await loadHiddenPages()
+}
+
+async function removeHiddenPage(key: string) {
+  try {
+    await browser.storage.local.remove(key)
+    hiddenPages.value = hiddenPages.value.filter(p => p.key !== key)
+    showToast('已恢复该页面的快捷方式显示', 'success')
+    // 如果当前页没有数据了，跳到上一页
+    if (paginatedHiddenPages.value.length === 0 && hiddenPagesPage.value > 1) {
+      hiddenPagesPage.value--
+    }
+  }
+  catch {
+    showToast('删除失败', 'error')
+  }
+}
+
+// 过滤后的隐藏页面列表
+const filteredHiddenPages = computed(() => {
+  const search = hiddenPagesSearch.value.trim().toLowerCase()
+  if (!search) return hiddenPages.value
+  return hiddenPages.value.filter(p => p.host.toLowerCase().includes(search))
+})
+
+// 总页数
+const hiddenPagesTotalPages = computed(() => {
+  return Math.max(1, Math.ceil(filteredHiddenPages.value.length / hiddenPagesPerPage))
+})
+
+// 当前页的数据
+const paginatedHiddenPages = computed(() => {
+  const start = (hiddenPagesPage.value - 1) * hiddenPagesPerPage
+  return filteredHiddenPages.value.slice(start, start + hiddenPagesPerPage)
+})
+
+// 切换页面
+function goToHiddenPage(page: number) {
+  hiddenPagesPage.value = Math.max(1, Math.min(page, hiddenPagesTotalPages.value))
+}
+
+// 搜索时重置到第一页
+function onHiddenPagesSearchChange() {
+  hiddenPagesPage.value = 1
+}
+
+// 初始化时加载隐藏页面列表
+void loadHiddenPages()
+
 
 function collectFolderIds(nodes: FolderNode[]) {
   const ids: string[] = []
@@ -1096,30 +1360,64 @@ watch(intervalDropdownOpen, (open) => {
   if (open)
     void positionIntervalDropdown()
 })
+
+watch(protocolDropdownOpen, (open) => {
+  if (open) {
+    void positionProtocolDropdown()
+    document.addEventListener('click', handleProtocolDropdownOutside)
+    document.addEventListener('keydown', handleProtocolEsc)
+    window.addEventListener('resize', handleProtocolResize)
+    window.addEventListener('scroll', handleProtocolScroll, true)
+  } else {
+    document.removeEventListener('click', handleProtocolDropdownOutside)
+    document.removeEventListener('keydown', handleProtocolEsc)
+    window.removeEventListener('resize', handleProtocolResize)
+    window.removeEventListener('scroll', handleProtocolScroll, true)
+  }
+})
 </script>
 
 <template>
   <main class="panel">
     <header class="panel__header">
       <div class="panel__brand">
-        <div class="panel__logo">
-          <ph-cloud-arrow-up class="panel__logo-icon" />
+        <div class="panel__logo" :class="`panel__logo--${syncProvider}`">
+          <Transition name="icon-fade" mode="out-in">
+            <ph-github-logo
+              v-if="syncProvider === 'gist'"
+              key="logo-gist"
+              class="panel__logo-icon panel__logo-icon--gist"
+            />
+            <ph-cloud-arrow-up
+              v-else
+              key="logo-webdav"
+              class="panel__logo-icon panel__logo-icon--webdav"
+            />
+          </Transition>
         </div>
-        <div>
-          <h1 class="panel__title">
-            {{ providerTitle }}
-          </h1>
-          <p class="panel__subtitle">
-            {{ providerSubtitle }}
-          </p>
-        </div>
+        <Transition :name="providerTransitionName" mode="out-in">
+          <div :key="syncProvider">
+            <h1 class="panel__title">
+              {{ providerTitle }}
+            </h1>
+            <p class="panel__subtitle">
+              {{ providerSubtitle }}
+            </p>
+          </div>
+        </Transition>
       </div>
-      <div class="panel__status" :data-state="activeValidationState">
-        <span class="panel__status-dot" />
-        <span v-if="activeValidationState === 'checking'">校验中</span>
-        <span v-else-if="activeValidationState === 'ok'">已连接</span>
-        <span v-else-if="activeValidationState === 'error'">连接失败</span>
-        <span v-else>未连接</span>
+      <div class="panel__actions">
+        <div class="panel__status" :data-state="activeValidationState">
+          <span class="panel__status-dot" />
+          <span v-if="activeValidationState === 'checking'">校验中</span>
+          <span v-else-if="activeValidationState === 'ok'">已连接</span>
+          <span v-else-if="activeValidationState === 'error'">连接失败</span>
+          <span v-else>未连接</span>
+        </div>
+        <button class="panel__hidden-btn" title="管理隐藏页面" @click="openHiddenPages">
+          <ph-eye-slash class="panel__hidden-icon" />
+          <span v-if="hiddenPages.length" class="panel__hidden-badge">{{ hiddenPages.length }}</span>
+        </button>
       </div>
     </header>
 
@@ -1148,7 +1446,8 @@ watch(intervalDropdownOpen, (open) => {
           连接配置
         </h2>
       </div>
-      <div class="provider-tabs">
+      <div class="provider-tabs" :data-provider="syncProvider">
+        <span class="provider-tabs__indicator" />
         <button
           class="provider-tab"
           :class="{ 'is-active': syncProvider === 'gist' }"
@@ -1165,13 +1464,20 @@ watch(intervalDropdownOpen, (open) => {
         </button>
       </div>
 
-      <div v-if="syncProvider === 'gist'" class="provider-form">
+      <Transition :name="providerTransitionName" mode="out-in">
+      <div v-if="syncProvider === 'gist'" class="provider-form" key="provider-gist">
         <div class="field">
           <label class="field__label">
             <ph-key class="field__icon" />
             GitHub Token
           </label>
-          <input v-model="githubToken" type="password" placeholder="ghp_xxxxxxxxxxxx" class="input">
+          <div class="input-with-toggle">
+            <input v-model="githubToken" :type="showGithubToken ? 'text' : 'password'" placeholder="ghp_xxxxxxxxxxxx" class="input">
+            <button class="input-toggle" type="button" :aria-label="showGithubToken ? '隐藏 Token' : '显示 Token'" @click="showGithubToken = !showGithubToken">
+              <ph-eye v-if="showGithubToken" class="input-toggle__icon" />
+              <ph-eye-slash v-else class="input-toggle__icon" />
+            </button>
+          </div>
         </div>
         <div class="field">
           <label class="field__label">
@@ -1240,13 +1546,53 @@ watch(intervalDropdownOpen, (open) => {
         </button>
       </div>
 
-      <div v-else class="provider-form">
+      <div v-else class="provider-form" key="provider-webdav">
         <div class="field">
           <label class="field__label">
             <ph-link class="field__icon" />
             WebDAV 地址
           </label>
-          <input v-model="webdavUrl" placeholder="https://dav.example.com/remote.php/dav/files/user/" class="input">
+          <div class="url-input-group">
+            <!-- 协议选择下拉 -->
+            <div ref="protocolDropdownRef" class="protocol-select" :class="{ 'is-open': protocolDropdownOpen }">
+              <button
+                ref="protocolDropdownTriggerRef"
+                type="button"
+                class="protocol-select__trigger"
+                :aria-expanded="protocolDropdownOpen"
+                @click.stop="toggleProtocolDropdown"
+              >
+                <span class="protocol-select__value">{{ webdavProtocol }}://</span>
+                <ph-caret-down class="protocol-select__arrow" />
+              </button>
+              <Transition name="fade">
+                <teleport to="body">
+                  <div
+                    v-if="protocolDropdownOpen"
+                    ref="protocolDropdownMenuRef"
+                    class="select-menu select-menu--protocol"
+                    role="listbox"
+                    :style="protocolDropdownStyle"
+                  >
+                    <button
+                      v-for="option in protocolOptions"
+                      :key="option.value"
+                      type="button"
+                      class="select-option"
+                      :class="{ 'is-active': option.value === webdavProtocol }"
+                      role="option"
+                      :aria-selected="option.value === webdavProtocol"
+                      @click.stop="selectProtocol(option.value)"
+                    >
+                      {{ option.label }}
+                    </button>
+                  </div>
+                </teleport>
+              </Transition>
+            </div>
+            <!-- 地址输入框 -->
+            <input v-model="webdavHost" placeholder="dav.example.com/remote.php/dav/files/user/" class="input url-input">
+          </div>
         </div>
         <div class="field">
           <label class="field__label">
@@ -1260,7 +1606,13 @@ watch(intervalDropdownOpen, (open) => {
             <ph-key class="field__icon" />
             密码
           </label>
-          <input v-model="webdavPassword" type="password" placeholder="可选" class="input">
+          <div class="input-with-toggle">
+            <input v-model="webdavPassword" :type="showWebdavPassword ? 'text' : 'password'" placeholder="可选" class="input">
+            <button class="input-toggle" type="button" :aria-label="showWebdavPassword ? '隐藏密码' : '显示密码'" @click="showWebdavPassword = !showWebdavPassword">
+              <ph-eye v-if="showWebdavPassword" class="input-toggle__icon" />
+              <ph-eye-slash v-else class="input-toggle__icon" />
+            </button>
+          </div>
         </div>
         <div class="field">
           <label class="field__label">
@@ -1314,6 +1666,7 @@ watch(intervalDropdownOpen, (open) => {
           {{ webdavValidationState === 'checking' ? '保存中…' : '保存配置' }}
         </button>
       </div>
+      </Transition>
     </section>
 
     <section class="card">
@@ -1565,6 +1918,83 @@ watch(intervalDropdownOpen, (open) => {
         </div>
       </div>
     </Transition>
+
+    <!-- 隐藏页面管理 -->
+    <Transition name="modal">
+      <div v-if="hiddenPagesVisible" class="modal-overlay" @click.self="hiddenPagesVisible = false">
+        <div class="modal">
+          <div class="modal__header">
+            <ph-eye-slash class="modal__icon" />
+            <h3 class="modal__title">
+              隐藏页面管理
+            </h3>
+          </div>
+          <div class="modal__body">
+            <!-- 搜索框 -->
+            <div v-if="hiddenPages.length > 0" class="hidden-pages-search">
+              <ph-magnifying-glass class="hidden-pages-search__icon" />
+              <input
+                v-model="hiddenPagesSearch"
+                type="text"
+                placeholder="搜索域名/IP..."
+                class="hidden-pages-search__input"
+                @input="onHiddenPagesSearchChange"
+              >
+              <button v-if="hiddenPagesSearch" class="hidden-pages-search__clear" @click="hiddenPagesSearch = ''; onHiddenPagesSearchChange()">
+                <ph-x />
+              </button>
+            </div>
+
+            <div v-if="hiddenPagesLoading" class="tree-loading">
+              <ph-circle-notch class="tree-loading__icon" />
+              <span>加载中…</span>
+            </div>
+            <div v-else-if="hiddenPages.length === 0" class="message" data-state="info">
+              暂无隐藏的页面
+            </div>
+            <div v-else-if="filteredHiddenPages.length === 0" class="message" data-state="info">
+              没有匹配的结果
+            </div>
+            <div v-else class="hidden-page-list">
+              <div v-for="page in paginatedHiddenPages" :key="page.key" class="hidden-page-item">
+                <div class="hidden-page-host" :title="page.host">
+                  {{ page.host }}
+                </div>
+                <button class="btn btn--danger-inline" @click="removeHiddenPage(page.key)">
+                  <ph-trash class="btn__icon" />
+                  删除
+                </button>
+              </div>
+            </div>
+
+            <!-- 分页控件 -->
+            <div v-if="filteredHiddenPages.length > hiddenPagesPerPage" class="hidden-pages-pagination">
+              <button
+                class="pagination-btn"
+                :disabled="hiddenPagesPage <= 1"
+                @click="goToHiddenPage(hiddenPagesPage - 1)"
+              >
+                <ph-caret-left />
+              </button>
+              <span class="pagination-info">{{ hiddenPagesPage }} / {{ hiddenPagesTotalPages }}</span>
+              <button
+                class="pagination-btn"
+                :disabled="hiddenPagesPage >= hiddenPagesTotalPages"
+                @click="goToHiddenPage(hiddenPagesPage + 1)"
+              >
+                <ph-caret-right />
+              </button>
+            </div>
+          </div>
+          <div class="modal__footer">
+            <span class="hidden-pages-count">共 {{ filteredHiddenPages.length }} 项</span>
+            <button class="btn btn--ghost" @click="hiddenPagesVisible = false">
+              关闭
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
   </main>
 </template>
 
@@ -1697,12 +2127,15 @@ watch(intervalDropdownOpen, (open) => {
   justify-content: space-between;
   align-items: center;
   padding-bottom: 4px;
+  gap: 8px;
 }
 
 .panel__brand {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex: 1;
+  min-width: 0;
 }
 
 .panel__logo {
@@ -1713,11 +2146,30 @@ watch(intervalDropdownOpen, (open) => {
   display: grid;
   place-items: center;
   box-shadow: 0 3px 8px rgba(232, 93, 59, 0.25);
+  flex-shrink: 0;
+}
+
+.panel__logo--gist {
+  background: linear-gradient(135deg, #ff7a5a 0%, #ff9a7a 100%);
+  box-shadow: 0 3px 8px rgba(232, 93, 59, 0.28);
+}
+
+.panel__logo--webdav {
+  background: linear-gradient(135deg, #3fb18d 0%, #6ed3b0 100%);
+  box-shadow: 0 3px 8px rgba(63, 177, 141, 0.28);
 }
 
 .panel__logo-icon {
   font-size: 16px;
   color: white;
+}
+
+.panel__logo-icon--gist {
+  color: #fff4ef;
+}
+
+.panel__logo-icon--webdav {
+  color: #ecfff6;
 }
 
 .panel__title {
@@ -1734,6 +2186,13 @@ watch(intervalDropdownOpen, (open) => {
   margin: 2px 0 0;
 }
 
+.panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
 .panel__status {
   display: flex;
   align-items: center;
@@ -1746,6 +2205,8 @@ watch(intervalDropdownOpen, (open) => {
   border: 1px solid var(--card-border);
   backdrop-filter: blur(8px);
   color: var(--ink-muted);
+  min-width: 60px;
+  justify-content: center;
 }
 
 .panel__status-dot {
@@ -1753,6 +2214,7 @@ watch(intervalDropdownOpen, (open) => {
   height: 6px;
   border-radius: 50%;
   background: var(--ink-muted);
+  flex-shrink: 0;
 }
 
 .panel__status[data-state="checking"] .panel__status-dot {
@@ -1826,9 +2288,11 @@ watch(intervalDropdownOpen, (open) => {
   border-radius: 12px;
   background: var(--bg-glass);
   border: 1px solid var(--card-border);
+  position: relative;
 }
 
 .provider-tab {
+  position: relative;
   flex: 1;
   border: none;
   padding: 6px 10px;
@@ -1838,20 +2302,74 @@ watch(intervalDropdownOpen, (open) => {
   font-weight: 500;
   color: var(--ink-muted);
   cursor: pointer;
-  transition: background 180ms ease, color 180ms ease, box-shadow 180ms ease;
+  transition: color 220ms ease, transform 220ms ease;
+  z-index: 1;
+}
+
+.provider-tabs__indicator {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: 4px;
+  width: calc(50% - 3px);
+  border-radius: 9px;
+  background: linear-gradient(140deg, rgba(255, 140, 102, 0.24), rgba(255, 140, 102, 0.08));
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.06);
+  transition: transform 260ms ease;
+}
+
+.provider-tabs[data-provider='webdav'] .provider-tabs__indicator {
+  transform: translateX(calc(100% + 6px));
 }
 
 .provider-tab.is-active {
-  background: var(--accent-soft);
   color: var(--accent);
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.04);
+  transform: translateY(-1px);
 }
+
 
 .provider-form {
   display: flex;
   flex-direction: column;
   gap: 10px;
   overflow: visible;
+}
+
+.slide-left-enter-active,
+.slide-left-leave-active,
+.slide-right-enter-active,
+.slide-right-leave-active {
+  transition: opacity 220ms ease, transform 260ms ease;
+}
+
+.slide-left-enter-from {
+  opacity: 0;
+  transform: translateX(18px);
+}
+
+.slide-left-leave-to {
+  opacity: 0;
+  transform: translateX(-18px);
+}
+
+.slide-right-enter-from {
+  opacity: 0;
+  transform: translateX(-18px);
+}
+
+.slide-right-leave-to {
+  opacity: 0;
+  transform: translateX(18px);
+}
+
+.icon-fade-enter-active,
+.icon-fade-leave-active {
+  transition: opacity 200ms ease;
+}
+
+.icon-fade-enter-from,
+.icon-fade-leave-to {
+  opacity: 0;
 }
 
 .version-list {
@@ -2213,6 +2731,107 @@ select.input optgroup {
   }
 }
 
+.select-menu--protocol {
+  max-height: 120px;
+}
+
+/* URL 输入组 */
+.url-input-group {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+}
+
+.protocol-select {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.protocol-select__trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2px;
+  padding: 8px 8px;
+  background: var(--bg-glass);
+  border: 1px solid var(--card-border);
+  border-right: none;
+  border-radius: 9px 0 0 9px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  height: 100%;
+  width: 88px;
+}
+
+.protocol-select__trigger:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.protocol-select.is-open .protocol-select__trigger {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.protocol-select__value {
+  font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+}
+
+.protocol-select__arrow {
+  font-size: 12px;
+  color: inherit;
+  transition: transform 0.15s ease, color 0.15s ease;
+  flex-shrink: 0;
+}
+
+.protocol-select.is-open .protocol-select__arrow {
+  transform: rotate(180deg);
+}
+
+.url-input {
+  border-radius: 0 9px 9px 0 !important;
+  flex: 1;
+  min-width: 0;
+}
+
+.input-with-toggle {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.input-with-toggle .input {
+  width: 100%;
+  padding-right: 36px;
+}
+
+.input-toggle {
+  position: absolute;
+  right: 10px;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  display: grid;
+  place-items: center;
+  color: var(--ink-muted);
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.input-toggle:hover {
+  color: var(--accent);
+}
+
+.input-toggle__icon {
+  font-size: 16px;
+}
+
+
 .select-option {
   width: 100%;
   border: 1px solid transparent;
@@ -2356,7 +2975,7 @@ select.input optgroup {
 }
 
 .btn__icon {
-  font-size: 12px;
+  font-size: 15px;
 }
 
 .btn__icon--spin {
@@ -2835,5 +3454,233 @@ select.input optgroup {
 .modal-enter-from .modal,
 .modal-leave-to .modal {
   transform: scale(0.95);
+}
+
+/* 隐藏页面管理按钮 */
+.panel__hidden-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--card-border);
+  background: var(--bg-glass);
+  border-radius: 50%;
+  color: var(--ink-muted);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  position: relative;
+  backdrop-filter: blur(8px);
+}
+
+.panel__hidden-btn:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.panel__hidden-icon {
+  font-size: 14px;
+}
+
+.panel__hidden-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: 8px;
+  min-width: 14px;
+  text-align: center;
+  line-height: 1.2;
+}
+
+/* 隐藏页面列表 */
+.hidden-page-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.hidden-page-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: #f8f7f4;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.hidden-page-host {
+  flex: 1;
+  font-size: 12px;
+  color: #555;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  .panel__hidden-btn {
+    background: var(--bg-glass);
+    color: var(--ink-muted);
+    border-color: var(--card-border);
+  }
+
+  .panel__hidden-btn:hover {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .hidden-page-item {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .hidden-page-host {
+    color: #aaa;
+  }
+
+  .hidden-pages-search {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .hidden-pages-search__input {
+    background: transparent;
+    color: #e0e0e0;
+  }
+
+  .hidden-pages-search__input::placeholder {
+    color: #888;
+  }
+
+  .hidden-pages-search__icon,
+  .hidden-pages-search__clear {
+    color: #888;
+  }
+
+  .pagination-btn {
+    background: rgba(255, 255, 255, 0.08);
+    color: #aaa;
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .pagination-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.15);
+    color: #fff;
+  }
+}
+
+/* 搜索框 */
+.hidden-pages-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: #f8f7f4;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 6px;
+  margin-bottom: 10px;
+}
+
+.hidden-pages-search__icon {
+  font-size: 14px;
+  color: #999;
+  flex-shrink: 0;
+}
+
+.hidden-pages-search__input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  font-size: 12px;
+  color: #333;
+  outline: none;
+}
+
+.hidden-pages-search__input::placeholder {
+  color: #999;
+}
+
+.hidden-pages-search__clear {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #999;
+  cursor: pointer;
+  border-radius: 50%;
+  transition: all 0.15s ease;
+}
+
+.hidden-pages-search__clear:hover {
+  background: rgba(0, 0, 0, 0.08);
+  color: #666;
+}
+
+/* 分页控件 */
+.hidden-pages-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.pagination-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  background: #fff;
+  border-radius: 6px;
+  color: #666;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.pagination-btn:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.pagination-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pagination-info {
+  font-size: 12px;
+  color: #666;
+  font-weight: 500;
+  min-width: 50px;
+  text-align: center;
+}
+
+/* 计数器 */
+.hidden-pages-count {
+  font-size: 11px;
+  color: var(--ink-muted);
+  margin-right: auto;
 }
 </style>
