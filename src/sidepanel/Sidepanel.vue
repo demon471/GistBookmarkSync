@@ -199,14 +199,20 @@ function isPortClosedError(error: unknown) {
     || message.includes('Receiving end does not exist')
 }
 
-async function safeSendMessage(...args: Parameters<typeof sendMessage>) {
+type BridgeDestination = Parameters<typeof sendMessage>[2]
+
+async function safeSendMessage<T = any>(
+  event: string,
+  data: unknown = null,
+  destination?: BridgeDestination,
+) {
   try {
-    return await sendMessage(...args)
+    return await sendMessage(event, (data ?? null) as any, destination) as T
   }
   catch (error) {
     if (!isPortClosedError(error))
       console.error(error)
-    return { ok: false, error: '消息通道已关闭' }
+    return { ok: false, error: '消息通道已关闭' } as T
   }
 }
 
@@ -274,6 +280,20 @@ function handleIntervalResize() {
 function handleIntervalScroll() {
   if (intervalDropdownOpen.value)
     void positionIntervalDropdown()
+}
+
+function addIntervalDropdownListeners() {
+  window.addEventListener('click', handleIntervalDropdownOutside)
+  window.addEventListener('keydown', handleIntervalEsc)
+  window.addEventListener('resize', handleIntervalResize)
+  window.addEventListener('scroll', handleIntervalScroll, { passive: true })
+}
+
+function removeIntervalDropdownListeners() {
+  window.removeEventListener('click', handleIntervalDropdownOutside)
+  window.removeEventListener('keydown', handleIntervalEsc)
+  window.removeEventListener('resize', handleIntervalResize)
+  window.removeEventListener('scroll', handleIntervalScroll)
 }
 
 // 协议下拉菜单控制
@@ -380,10 +400,6 @@ onMounted(() => {
   void notifySidepanelOpen()
   window.addEventListener('pagehide', handleSidepanelHide)
   window.addEventListener('beforeunload', handleSidepanelHide)
-  window.addEventListener('click', handleIntervalDropdownOutside)
-  window.addEventListener('keydown', handleIntervalEsc)
-  window.addEventListener('resize', handleIntervalResize)
-  window.addEventListener('scroll', handleIntervalScroll, { passive: true })
   watch(
     () => exportModalVisible.value || webdavVersionsVisible.value || syncLogVisible.value,
     locked => setScrollLock(locked),
@@ -417,10 +433,11 @@ onBeforeUnmount(() => {
   window.removeEventListener('pagehide', handleSidepanelHide)
   window.removeEventListener('beforeunload', handleSidepanelHide)
   void notifySidepanelClosed()
-  window.removeEventListener('click', handleIntervalDropdownOutside)
-  window.removeEventListener('keydown', handleIntervalEsc)
-  window.removeEventListener('resize', handleIntervalResize)
-  window.removeEventListener('scroll', handleIntervalScroll)
+  removeIntervalDropdownListeners()
+  document.removeEventListener('click', handleProtocolDropdownOutside)
+  document.removeEventListener('keydown', handleProtocolEsc)
+  window.removeEventListener('resize', handleProtocolResize)
+  window.removeEventListener('scroll', handleProtocolScroll, true)
   setScrollLock(false)
 })
 
@@ -559,7 +576,9 @@ async function checkConnection(force = false) {
 }
 
 onMessage('sync-error', ({ data }) => {
-  const message = typeof data?.message === 'string' ? data.message : '同步失败'
+  const message = (data && typeof data === 'object' && 'message' in data && typeof (data as { message?: unknown }).message === 'string')
+    ? (data as { message: string }).message
+    : '同步失败'
   showToast(message, 'error')
 })
 
@@ -726,7 +745,7 @@ async function syncNow() {
   uploadState.value = 'syncing'
 
   try {
-    const result = await safeSendMessage('sync-upload', undefined, 'background')
+    const result = await safeSendMessage('sync-upload', null, 'background')
     if (result.ok) {
       uploadState.value = 'done'
       showToast(result.summary || '推送成功', 'success')
@@ -746,7 +765,7 @@ async function downloadBookmarks(options?: { silent?: boolean }) {
   downloadState.value = 'syncing'
 
   try {
-    const result = await safeSendMessage('sync-download', undefined, 'background')
+    const result = await safeSendMessage('sync-download', null, 'background')
     if (result.ok) {
       downloadState.value = 'done'
       if (!options?.silent)
@@ -806,7 +825,7 @@ async function loadWebdavVersions() {
   webdavVersionsMessage.value = ''
 
   try {
-    const result = await safeSendMessage('webdav-list-versions', undefined, 'background') as { ok: boolean, error?: string, versions?: Array<{ file: string, timestamp: string, count?: number }> }
+    const result = await safeSendMessage('webdav-list-versions', null, 'background') as { ok: boolean, error?: string, versions?: Array<{ file: string, timestamp: string, count?: number }> }
     if (!result.ok) {
       webdavVersionsState.value = 'error'
       webdavVersionsMessage.value = result.error || '加载版本失败'
@@ -1242,7 +1261,7 @@ async function loadFolderTree() {
   folderTreeMessage.value = ''
 
   try {
-    const result = await safeSendMessage('get-bookmark-folders', undefined, 'background')
+    const result = await safeSendMessage('get-bookmark-folders', null, 'background')
     if (!result.ok) {
       folderTreeState.value = 'error'
       folderTreeMessage.value = result.error || 'Failed to load bookmarks'
@@ -1291,7 +1310,7 @@ async function triggerUploadAfterSave() {
 
   try {
     uploadState.value = 'syncing'
-    const result = await safeSendMessage('sync-upload', undefined, 'background')
+    const result = await safeSendMessage('sync-upload', null, 'background')
     if (result.ok) {
       uploadState.value = 'done'
       showToast(result.summary || '同步范围已保存并推送', 'success')
@@ -1357,8 +1376,13 @@ watch(syncProvider, (nextProvider) => {
 })
 
 watch(intervalDropdownOpen, (open) => {
-  if (open)
+  if (open) {
     void positionIntervalDropdown()
+    addIntervalDropdownListeners()
+  }
+  else {
+    removeIntervalDropdownListeners()
+  }
 })
 
 watch(protocolDropdownOpen, (open) => {
@@ -1375,6 +1399,7 @@ watch(protocolDropdownOpen, (open) => {
     window.removeEventListener('scroll', handleProtocolScroll, true)
   }
 })
+
 </script>
 
 <template>
@@ -2311,15 +2336,16 @@ watch(protocolDropdownOpen, (open) => {
   top: 4px;
   bottom: 4px;
   left: 4px;
-  width: calc(50% - 3px);
+  right: calc(50% + 1px);
   border-radius: 9px;
   background: linear-gradient(140deg, rgba(255, 140, 102, 0.24), rgba(255, 140, 102, 0.08));
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.06);
-  transition: transform 260ms ease;
+  transition: left 260ms ease, right 260ms ease;
 }
 
 .provider-tabs[data-provider='webdav'] .provider-tabs__indicator {
-  transform: translateX(calc(100% + 6px));
+  left: calc(50% + 1px);
+  right: 4px;
 }
 
 .provider-tab.is-active {
@@ -2775,6 +2801,7 @@ select.input optgroup {
   background: var(--accent-soft);
   color: var(--accent);
   border-color: var(--accent);
+  border-right: 1px solid var(--accent);
 }
 
 .protocol-select__value {
