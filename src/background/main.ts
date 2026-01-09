@@ -590,7 +590,7 @@ async function applyWebDavDownload(
   await ensureLocalEntries(root.id, index, mergedNodes)
 
   const mergedCount = countBookmarks(mergedNodes)
-  const summary = `拉取成功 ${mergedCount} 条书签`
+  const summary = `成功同步 ${mergedCount} 条书签`
   const timestamp = new Date().toISOString()
 
   await browser.storage.local.set({
@@ -1687,7 +1687,7 @@ async function performSync(mode: 'upload' | 'download') {
         }
 
         const localCount = countBookmarks(localNodes)
-        const summary = `推送成功 ${localCount} 条书签`
+        const summary = `成功同步 ${localCount} 条书签`
         const timestamp = new Date().toISOString()
 
         await browser.storage.local.set({
@@ -1770,7 +1770,7 @@ async function performSync(mode: 'upload' | 'download') {
         return await finalizeSyncResult(provider, mode, { ok: false, error: 'Failed to update Gist' })
 
       const localCount = countBookmarks(localNodes)
-      const summary = `推送成功 ${localCount} 条书签`
+      const summary = `成功同步 ${localCount} 条书签`
       const timestamp = new Date().toISOString()
 
       await browser.storage.local.set({
@@ -1798,7 +1798,7 @@ async function performSync(mode: 'upload' | 'download') {
       await ensureLocalEntries(root.id, index, mergedNodes)
 
       const mergedCount = countBookmarks(mergedNodes)
-      const summary = `拉取成功 ${mergedCount} 条书签`
+      const summary = `成功同步 ${mergedCount} 条书签`
       const timestamp = new Date().toISOString()
 
       await browser.storage.local.set({

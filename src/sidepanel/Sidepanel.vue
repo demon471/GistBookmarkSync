@@ -180,9 +180,8 @@ function formatSyncLogTime(time: string) {
 
 function formatSyncLogTitle(entry: SyncLogEntry) {
   const providerLabel = entry.provider === 'webdav' ? 'WebDAV' : 'Gist'
-  const modeLabel = entry.mode === 'upload' ? '推送' : '拉取'
   const statusLabel = entry.status === 'ok' ? '成功' : '失败'
-  return `${providerLabel} · ${modeLabel} · ${statusLabel}`
+  return `${providerLabel} · ${statusLabel}`
 }
 
 function formatSyncLogSummary(entry: SyncLogEntry) {

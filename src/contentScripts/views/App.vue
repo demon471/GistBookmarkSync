@@ -72,13 +72,13 @@ function snapToEdge(side?: ShortcutPosition["side"]) {
   const viewportWidth = window.innerWidth;
   const viewportHeight = window.innerHeight;
   const scrollbar = getScrollbarMetrics();
-  const edgePadding = 8;
+  const edgePadding = 4;
+  // 只有在检测到滚动条时才预留空间
+  const scrollbarReserve = scrollbar.width > 0 ? Math.max(scrollbar.width, 4) : 0;
   const inferredSide =
     side || (pos.value.x + width / 2 < viewportWidth / 2 ? "left" : "right");
-  const leftInset =
-    scrollbar.width > 0 && scrollbar.onLeft ? scrollbar.width : 0;
-  const rightInset =
-    scrollbar.width > 0 && !scrollbar.onLeft ? scrollbar.width : 0;
+  const leftInset = scrollbar.onLeft ? scrollbarReserve : 0;
+  const rightInset = !scrollbar.onLeft ? scrollbarReserve : 0;
   const x =
     inferredSide === "left"
       ? leftInset + edgePadding
@@ -546,9 +546,15 @@ onBeforeUnmount(() => {
   display: block;
 }
 
-.shortcut.is-hover .close-btn {
+.shortcut.is-hover:not(.is-dragging) .close-btn {
   opacity: 1;
   transform: scale(1);
+}
+
+/* 拖动时隐藏关闭按钮 */
+.shortcut.is-dragging .close-btn {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .close-btn:hover {
@@ -591,29 +597,23 @@ onBeforeUnmount(() => {
 }
 
 .shortcut-btn {
-  width: 32px;
-  height: 32px;
+  width: 36px;
+  height: 36px;
   border-radius: 999px;
   border: none;
-  background: linear-gradient(145deg, #ffffff, #f1f5f9);
-  backdrop-filter: blur(16px) saturate(180%);
-  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  background: #ff9a7a;
   color: #333;
   display: grid;
   place-items: center;
   box-shadow: 
-    0 3px 16px rgba(0, 0, 0, 0.14),
-    0 1px 6px rgba(0, 0, 0, 0.1),
+    0 3px 12px rgba(0, 0, 0, 0.15),
+    0 1px 4px rgba(0, 0, 0, 0.1),
     inset 0 1px 1px rgba(255, 255, 255, 0.9);
   cursor: pointer;
   transition: 
     transform 350ms cubic-bezier(0.34, 1.56, 0.64, 1), 
-    opacity 300ms ease, 
-    filter 300ms ease, 
-    border-radius 300ms ease, 
-    box-shadow 300ms ease;
+    opacity 300ms ease;
   opacity: 0.5;
-  filter: grayscale(0.1);
   touch-action: none;
   position: relative;
   z-index: 2;
@@ -688,12 +688,10 @@ onBeforeUnmount(() => {
   transition: none;
 }
 
-/* 贴边时用单一背景块，避免拼接感 */
+/* 贴边时保持圆形背景 */
 .shortcut.side-right:not(.is-dragging) .shortcut-btn,
 .shortcut.side-left:not(.is-dragging) .shortcut-btn {
-  background: transparent;
   border: none;
-  box-shadow: none;
 }
 
 .sidebar-btn {
@@ -830,22 +828,12 @@ onBeforeUnmount(() => {
 }
 
 .icon-logo {
-  width: 16px;
-  height: 16px;
+  width: 24px;
+  height: 24px;
   display: block;
   object-fit: contain;
   object-position: center;
-  margin: 0 auto;
   pointer-events: none;
-  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.12));
-}
-
-.shortcut.side-right:not(.is-dragging) .icon-logo {
-  transform: translateX(3px);
-}
-
-.shortcut.side-left:not(.is-dragging) .icon-logo {
-  transform: translateX(-3px);
 }
 
 /* 悬浮操作按钮 */
