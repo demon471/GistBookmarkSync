@@ -25,6 +25,77 @@ browser.runtime.onInstalled.addListener((): void => {
   console.log('Extension installed')
 })
 
+async function ensureOffscreenDocument() {
+  // @ts-expect-error offscreen is not typed in chrome types
+  const offscreen = chrome.offscreen as {
+    hasDocument?: () => Promise<boolean>
+    createDocument?: (options: {
+      url: string
+      reasons: string[]
+      justification: string
+    }) => Promise<void>
+  } | undefined
+
+  if (!offscreen?.createDocument)
+    return
+
+  try {
+    const hasDoc = await offscreen.hasDocument?.()
+    if (hasDoc)
+      return
+
+    await offscreen.createDocument({
+      url: 'dist/offscreen/index.html',
+      reasons: ['MATCH_MEDIA'],
+      justification: 'Listen for prefers-color-scheme changes to update the toolbar icon.',
+    })
+  }
+  catch (error) {
+    console.error('Failed to create offscreen document:', error)
+  }
+}
+
+void ensureOffscreenDocument()
+chrome.runtime.onStartup?.addListener(() => {
+  void ensureOffscreenDocument()
+})
+
+function getThemeIconPaths(isDark: boolean) {
+  const build = (name: string, size: number) =>
+    chrome.runtime.getURL(`assets/${name}-${size}.png`)
+
+  return isDark
+    ? {
+        16: build('logo-dark', 16),
+        32: build('logo-dark', 32),
+        48: build('logo-dark', 48),
+        128: build('logo-dark', 128),
+      }
+    : {
+        16: build('logo-light', 16),
+        32: build('logo-light', 32),
+        48: build('logo-light', 48),
+        128: build('logo-light', 128),
+      }
+}
+
+// 监听图标切换请求（跟随系统主题）
+chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
+  if (message && message.action === 'update-icon' && message.theme) {
+    const isDark = message.theme === 'dark'
+    const path = getThemeIconPaths(isDark)
+
+    // @ts-expect-error missing types
+    chrome.action.setIcon({ path }, () => {
+      if (chrome.runtime.lastError) {
+        console.error('Failed to set icon:', chrome.runtime.lastError.message)
+      }
+    })
+  }
+})
+
+const INITIAL_DOWNLOAD_KEY = 'initial-download-done'
+
 let previousTabId = 0
 const sidePanelOpenByTab = new Map<number, boolean>()
 let bookmarkEventSuspension = 0
@@ -981,6 +1052,57 @@ async function runAutoUpload() {
   }
 }
 
+async function runInitialDownloadOnce() {
+  try {
+    const stored = await browser.storage.local.get([
+      INITIAL_DOWNLOAD_KEY,
+      'sync-provider',
+      'github-token',
+      'gist-id',
+      'gist-file-name',
+      'webdav-url',
+    ])
+    if (stored[INITIAL_DOWNLOAD_KEY])
+      return
+
+    const provider = (stored['sync-provider'] as string | undefined) || 'gist'
+    const token = (stored['github-token'] as string | undefined)?.trim()
+    const gistId = (stored['gist-id'] as string | undefined)?.trim()
+    const fileName = (stored['gist-file-name'] as string | undefined)?.trim()
+    const webdavUrl = (stored['webdav-url'] as string | undefined)?.trim()
+
+    if (provider === 'webdav') {
+      if (!webdavUrl) {
+        debugLog('Initial download skipped: missing webdavUrl')
+        return
+      }
+    }
+    else if (provider === 'gist') {
+      if (!token || !gistId || !fileName) {
+        debugLog('Initial download skipped: missing gist config')
+        return
+      }
+    }
+    else {
+      debugLog('Initial download skipped: unknown provider', provider)
+      return
+    }
+
+    debugLog('Initial download performSync, provider:', provider)
+    const result = await performSync('download')
+    if (!result.ok) {
+      debugLog('Initial download error', result.error)
+      return
+    }
+
+    await browser.storage.local.set({ [INITIAL_DOWNLOAD_KEY]: true })
+    debugLog('Initial download ok')
+  }
+  catch (error) {
+    debugLog('Initial download exception', error)
+  }
+}
+
 function scheduleAutoUpload() {
   if (bookmarkEventSuspension > 0)
     return
@@ -1029,6 +1151,11 @@ async function bootstrapSyncIntervalAlarm() {
 
 void bootstrapSyncIntervalAlarm()
 void normalizeSyncLogs()
+if (browser.runtime.onStartup) {
+  browser.runtime.onStartup.addListener(() => {
+    void runInitialDownloadOnce()
+  })
+}
 
 if (browser.alarms) {
   browser.alarms.onAlarm.addListener(async (alarm) => {

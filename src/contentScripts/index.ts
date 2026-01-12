@@ -23,7 +23,7 @@ import { setupApp } from '~/logic/common-setup'
   styleEl.setAttribute('href', browser.runtime.getURL('dist/contentScripts/style.css'))
   shadowDOM.appendChild(styleEl)
   shadowDOM.appendChild(root)
-  document.body.appendChild(container)
+  document.body.appendChild(container);
 
   // Wait for CSS to load before mounting Vue app to prevent flash of unstyled content
   const mountApp = () => {

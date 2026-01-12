@@ -14,7 +14,34 @@ export async function getManifest() {
     version: pkg.version,
     description: pkg.description,
     action: {
-      default_icon: 'assets/logo.png',
+      default_icon: {
+        16: 'assets/logo-light-16.png',
+        32: 'assets/logo-light-32.png',
+        48: 'assets/logo-light-48.png',
+        128: 'assets/logo-light-128.png',
+      },
+      theme_icons: [
+        {
+          light: 'assets/logo-light-16.png',
+          dark: 'assets/logo-dark-16.png',
+          size: 16,
+        },
+        {
+          light: 'assets/logo-light-32.png',
+          dark: 'assets/logo-dark-32.png',
+          size: 32,
+        },
+        {
+          light: 'assets/logo-light-48.png',
+          dark: 'assets/logo-dark-48.png',
+          size: 48,
+        },
+        {
+          light: 'assets/logo-light-128.png',
+          dark: 'assets/logo-dark-128.png',
+          size: 128,
+        },
+      ],
     },
     background: isFirefox
       ? {
@@ -25,9 +52,9 @@ export async function getManifest() {
           service_worker: 'dist/background/index.mjs',
         },
     icons: {
-      16: 'assets/logo.png',
-      48: 'assets/logo.png',
-      128: 'assets/logo.png',
+      16: 'assets/logo-light-16.png',
+      48: 'assets/logo-light-48.png',
+      128: 'assets/logo-light-128.png',
     },
     permissions: [
       'tabs',
@@ -74,6 +101,7 @@ export async function getManifest() {
     (manifest as any).side_panel = {
       default_path: 'dist/sidepanel/index.html',
     }
+    manifest.permissions?.push('offscreen')
   }
 
   // FIXME: not work in MV3
