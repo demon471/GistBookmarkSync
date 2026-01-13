@@ -657,10 +657,15 @@ onBeforeUnmount(() => {
   z-index: 2;
 }
 
-/* 拖动时立即还原圆形，无动画 */
+/* 拖动时立即还原圆形，无动画，背景恢复 36px */
 .shortcut.is-dragging .shortcut-btn {
+  width: 36px;
+  height: 36px;
   border-radius: 999px !important;
-  border-color: rgba(0, 0, 0, 0.08) !important;
+  border: none !important;
+  background: #ffffff !important;
+  box-shadow: none;
+  opacity: 0.9;
   transition: none;
 }
 
@@ -716,7 +721,7 @@ onBeforeUnmount(() => {
   transition: opacity 280ms ease;
 }
 
-/* 拖动时立即隐藏延伸部分，无动画 */
+/* 拖动时隐藏延伸部分，保持圆形 */
 .shortcut.is-dragging .shortcut-btn::before {
   opacity: 0;
   transition: none;
@@ -792,8 +797,7 @@ onBeforeUnmount(() => {
   transition: color 200ms ease, transform 200ms ease;
 }
 
-.shortcut.is-hover .shortcut-btn,
-.shortcut.is-dragging .shortcut-btn {
+.shortcut.is-hover .shortcut-btn {
   opacity: 1;
   filter: none;
 }
@@ -1112,7 +1116,12 @@ onBeforeUnmount(() => {
 }
 
 .shortcut.is-dark.is-dragging .shortcut-btn {
-  border-color: rgba(255, 255, 255, 0.12) !important;
+  width: 36px;
+  height: 36px;
+  border: none !important;
+  background: linear-gradient(145deg, #3f3f46, #27272a) !important;
+  box-shadow: none;
+  opacity: 0.9;
 }
 
 /* 暗黑模式：延伸背景反色变为深灰，与侧边栏按钮一致 */
