@@ -44,6 +44,7 @@ const folderTreeState = ref<'idle' | 'loading' | 'error'>('idle')
 const folderTreeMessage = ref('')
 const selectedFolderIds = ref(new Set<string>())
 const savedFolderIds = ref(new Set<string>()) // 已保存的选择，用于统计
+const syncScopeExpanded = ref(false)
 const currentTabId = ref<number | null>(null)
 const webdavVersionsVisible = ref(false)
 const webdavVersionsState = ref<'idle' | 'loading' | 'error'>('idle')
@@ -602,8 +603,7 @@ async function validateGistAuth() {
       'background',
     )
 
-    // Log result
-    console.log('[Gist Validation Result]', result)
+    // Gist validation result processing
 
     const res = result as any
 
@@ -625,7 +625,7 @@ async function validateGistAuth() {
     gistValidationState.value = 'error'
     connectionStatus.value = 'error'
     lastValidationTime.value = Date.now()
-    
+
     const context = res.errors?.join('; ') || '保存失败'
     console.error('[Gist Validation Error]', context, result)
     showToast(context, 'error')
@@ -709,8 +709,7 @@ async function validateWebdavAuth() {
       'background',
     )
 
-    // Log result
-    console.log('[WebDAV Validation Result]', result)
+    // WebDAV validation result processing
 
     if (result.ok) {
       webdavValidationState.value = 'ok'
@@ -725,7 +724,7 @@ async function validateWebdavAuth() {
 
     webdavValidationState.value = 'error'
     webdavConnectionStatus.value = 'error'
-    
+
     // Enhanced error logging
     const res = result as any
     const errorDetail = res.error || res.message || (Array.isArray(res.errors) ? res.errors.join('; ') : '') || '未知错误'
@@ -916,7 +915,7 @@ function formatWebdavFileLabel(item: { file: string, seq?: number }) {
 function exportConfig() {
   // 提取隐藏的域名列表
   const hiddenHosts = hiddenPages.value.map(p => p.host)
-  
+
   const config = {
     syncProvider: syncProvider.value,
     githubToken: githubToken.value,
@@ -996,7 +995,7 @@ function importConfig() {
         storagePayload['sync-interval-minutes'] = config.syncIntervalMinutes
       if (Array.isArray(config.syncFolderSelection))
         storagePayload['sync-folder-selection'] = config.syncFolderSelection
-      
+
       // 导入隐藏的域名列表 - 合并模式，不会覆盖现有的
       // browser.storage.local.set() 只会更新/添加 keys，不会删除其他 keys
       let importedHiddenCount = 0
@@ -1008,20 +1007,20 @@ function importConfig() {
           }
         }
       }
-      
+
       if (Object.keys(storagePayload).length > 0)
         await browser.storage.local.set(storagePayload)
       if (typeof config.syncIntervalMinutes === 'number')
         void safeSendMessage('refresh-sync-interval', { minutes: config.syncIntervalMinutes }, 'background')
-      
+
       // 重新加载隐藏页面列表（会读取所有 hidden-host: 和 hidden-page: keys）
       await loadHiddenPages()
-      
+
       // 显示导入结果
       if (importedHiddenCount > 0) {
         showToast(`已合并 ${importedHiddenCount} 个隐藏域名`, 'success')
       }
-      
+
       await handleImportSyncFlow()
     }
     catch {
@@ -1146,12 +1145,14 @@ async function loadHiddenPages() {
       if (key.startsWith('hidden-host:') && value === true) {
         const host = key.replace('hidden-host:', '')
         pages.push({ key, host })
-      } else if (key.startsWith('hidden-page:') && value === true) {
+      }
+      else if (key.startsWith('hidden-page:') && value === true) {
         // 旧格式：从完整 URL 中提取域名
         try {
           const url = new URL(key.replace('hidden-page:', ''))
           pages.push({ key, host: url.hostname })
-        } catch {
+        }
+        catch {
           // 如果解析失败，直接使用原值
           const host = key.replace('hidden-page:', '')
           pages.push({ key, host })
@@ -1173,6 +1174,25 @@ async function openHiddenPages() {
   await loadHiddenPages()
 }
 
+// 过滤后的隐藏页面列表
+const filteredHiddenPages = computed(() => {
+  const search = hiddenPagesSearch.value.trim().toLowerCase()
+  if (!search)
+    return hiddenPages.value
+  return hiddenPages.value.filter(p => p.host.toLowerCase().includes(search))
+})
+
+// 总页数
+const hiddenPagesTotalPages = computed(() => {
+  return Math.max(1, Math.ceil(filteredHiddenPages.value.length / hiddenPagesPerPage))
+})
+
+// 当前页的数据
+const paginatedHiddenPages = computed(() => {
+  const start = (hiddenPagesPage.value - 1) * hiddenPagesPerPage
+  return filteredHiddenPages.value.slice(start, start + hiddenPagesPerPage)
+})
+
 async function removeHiddenPage(key: string) {
   try {
     await browser.storage.local.remove(key)
@@ -1188,24 +1208,6 @@ async function removeHiddenPage(key: string) {
   }
 }
 
-// 过滤后的隐藏页面列表
-const filteredHiddenPages = computed(() => {
-  const search = hiddenPagesSearch.value.trim().toLowerCase()
-  if (!search) return hiddenPages.value
-  return hiddenPages.value.filter(p => p.host.toLowerCase().includes(search))
-})
-
-// 总页数
-const hiddenPagesTotalPages = computed(() => {
-  return Math.max(1, Math.ceil(filteredHiddenPages.value.length / hiddenPagesPerPage))
-})
-
-// 当前页的数据
-const paginatedHiddenPages = computed(() => {
-  const start = (hiddenPagesPage.value - 1) * hiddenPagesPerPage
-  return filteredHiddenPages.value.slice(start, start + hiddenPagesPerPage)
-})
-
 // 切换页面
 function goToHiddenPage(page: number) {
   hiddenPagesPage.value = Math.max(1, Math.min(page, hiddenPagesTotalPages.value))
@@ -1218,7 +1220,6 @@ function onHiddenPagesSearchChange() {
 
 // 初始化时加载隐藏页面列表
 void loadHiddenPages()
-
 
 function collectFolderIds(nodes: FolderNode[]) {
   const ids: string[] = []
@@ -1391,14 +1392,14 @@ watch(protocolDropdownOpen, (open) => {
     document.addEventListener('keydown', handleProtocolEsc)
     window.addEventListener('resize', handleProtocolResize)
     window.addEventListener('scroll', handleProtocolScroll, true)
-  } else {
+  }
+  else {
     document.removeEventListener('click', handleProtocolDropdownOutside)
     document.removeEventListener('keydown', handleProtocolEsc)
     window.removeEventListener('resize', handleProtocolResize)
     window.removeEventListener('scroll', handleProtocolScroll, true)
   }
 })
-
 </script>
 
 <template>
@@ -1489,207 +1490,207 @@ watch(protocolDropdownOpen, (open) => {
       </div>
 
       <Transition :name="providerTransitionName" mode="out-in">
-      <div v-if="syncProvider === 'gist'" class="provider-form" key="provider-gist">
-        <div class="field">
-          <label class="field__label">
-            <ph-key class="field__icon" />
-            GitHub Token
-          </label>
-          <div class="input-with-toggle">
-            <input v-model="githubToken" :type="showGithubToken ? 'text' : 'password'" placeholder="ghp_xxxxxxxxxxxx" class="input">
-            <button class="input-toggle" type="button" :aria-label="showGithubToken ? '隐藏 Token' : '显示 Token'" @click="showGithubToken = !showGithubToken">
-              <ph-eye v-if="showGithubToken" class="input-toggle__icon" />
-              <ph-eye-slash v-else class="input-toggle__icon" />
-            </button>
+        <div v-if="syncProvider === 'gist'" key="provider-gist" class="provider-form">
+          <div class="field">
+            <label class="field__label">
+              <ph-key class="field__icon" />
+              GitHub Token
+            </label>
+            <div class="input-with-toggle">
+              <input v-model="githubToken" :type="showGithubToken ? 'text' : 'password'" placeholder="ghp_xxxxxxxxxxxx" class="input">
+              <button class="input-toggle" type="button" :aria-label="showGithubToken ? '隐藏 Token' : '显示 Token'" @click="showGithubToken = !showGithubToken">
+                <ph-eye v-if="showGithubToken" class="input-toggle__icon" />
+                <ph-eye-slash v-else class="input-toggle__icon" />
+              </button>
+            </div>
           </div>
-        </div>
-        <div class="field">
-          <label class="field__label">
-            <ph-identification-badge class="field__icon" />
-            Gist ID
-          </label>
-          <input v-model="gistId" placeholder="留空可自动创建" class="input">
-        </div>
-        <div class="field">
-          <label class="field__label">
-            <ph-file-text class="field__icon" />
-            文件名
-          </label>
-          <input v-model="gistFileName" placeholder="bookmarks" class="input">
-        </div>
-        <div class="field">
-          <label class="field__label">
-            <ph-timer class="field__icon" />
-            自动拉取间隔
-            <button class="link-ghost" type="button" @click.stop="openSyncLog">
-              查看日志 <span v-if="syncLogCount">({{ syncLogCount }})</span>
-            </button>
-          </label>
-          <div ref="intervalDropdownRef" class="select-input" :class="{ 'is-open': intervalDropdownOpen }">
-            <button
-              ref="intervalDropdownTriggerRef"
-              type="button"
-              class="select-input__trigger input"
-              :aria-expanded="intervalDropdownOpen"
-              @click.stop="toggleIntervalDropdown"
-            >
-              <span class="select-input__value">{{ syncIntervalLabel }}</span>
-              <ph-caret-down class="select-input__arrow" />
-            </button>
-            <Transition name="fade">
-              <teleport to="body">
-                <div
-                  v-if="intervalDropdownOpen"
-                  ref="intervalDropdownMenuRef"
-                  class="select-menu"
-                  role="listbox"
-                  :style="intervalDropdownStyle"
-                >
-                  <button
-                    v-for="option in syncIntervalOptions"
-                    :key="option.value"
-                    type="button"
-                    class="select-option"
-                    :class="{ 'is-active': option.value === syncIntervalMinutes }"
-                    role="option"
-                    :aria-selected="option.value === syncIntervalMinutes"
-                    @click.stop="selectInterval(option.value)"
-                  >
-                    <span>{{ option.label }}</span>
-                    <ph-check v-if="option.value === syncIntervalMinutes" class="select-option__check" />
-                  </button>
-                </div>
-              </teleport>
-            </Transition>
+          <div class="field">
+            <label class="field__label">
+              <ph-identification-badge class="field__icon" />
+              Gist ID
+            </label>
+            <input v-model="gistId" placeholder="留空可自动创建" class="input">
           </div>
-        </div>
-        <button class="btn btn--primary btn--input" :disabled="gistValidationState === 'checking'" @click="validateGistAuth">
-          <ph-floppy-disk v-if="gistValidationState !== 'checking'" class="btn__icon" />
-          <ph-circle-notch v-else class="btn__icon btn__icon--spin" />
-          {{ gistValidationState === 'checking' ? '保存中…' : '保存配置' }}
-        </button>
-      </div>
-
-      <div v-else class="provider-form" key="provider-webdav">
-        <div class="field">
-          <label class="field__label">
-            <ph-link class="field__icon" />
-            WebDAV 地址
-          </label>
-          <div class="url-input-group">
-            <!-- 协议选择下拉 -->
-            <div ref="protocolDropdownRef" class="protocol-select" :class="{ 'is-open': protocolDropdownOpen }">
+          <div class="field">
+            <label class="field__label">
+              <ph-file-text class="field__icon" />
+              文件名
+            </label>
+            <input v-model="gistFileName" placeholder="bookmarks" class="input">
+          </div>
+          <div class="field">
+            <label class="field__label">
+              <ph-timer class="field__icon" />
+              自动拉取间隔
+              <button class="link-ghost" type="button" @click.stop="openSyncLog">
+                查看日志 <span v-if="syncLogCount">({{ syncLogCount }})</span>
+              </button>
+            </label>
+            <div ref="intervalDropdownRef" class="select-input" :class="{ 'is-open': intervalDropdownOpen }">
               <button
-                ref="protocolDropdownTriggerRef"
+                ref="intervalDropdownTriggerRef"
                 type="button"
-                class="protocol-select__trigger"
-                :aria-expanded="protocolDropdownOpen"
-                @click.stop="toggleProtocolDropdown"
+                class="select-input__trigger input"
+                :aria-expanded="intervalDropdownOpen"
+                @click.stop="toggleIntervalDropdown"
               >
-                <span class="protocol-select__value">{{ webdavProtocol }}://</span>
-                <ph-caret-down class="protocol-select__arrow" />
+                <span class="select-input__value">{{ syncIntervalLabel }}</span>
+                <ph-caret-down class="select-input__arrow" />
               </button>
               <Transition name="fade">
                 <teleport to="body">
                   <div
-                    v-if="protocolDropdownOpen"
-                    ref="protocolDropdownMenuRef"
-                    class="select-menu select-menu--protocol"
+                    v-if="intervalDropdownOpen"
+                    ref="intervalDropdownMenuRef"
+                    class="select-menu"
                     role="listbox"
-                    :style="protocolDropdownStyle"
+                    :style="intervalDropdownStyle"
                   >
                     <button
-                      v-for="option in protocolOptions"
+                      v-for="option in syncIntervalOptions"
                       :key="option.value"
                       type="button"
                       class="select-option"
-                      :class="{ 'is-active': option.value === webdavProtocol }"
+                      :class="{ 'is-active': option.value === syncIntervalMinutes }"
                       role="option"
-                      :aria-selected="option.value === webdavProtocol"
-                      @click.stop="selectProtocol(option.value)"
+                      :aria-selected="option.value === syncIntervalMinutes"
+                      @click.stop="selectInterval(option.value)"
                     >
-                      {{ option.label }}
+                      <span>{{ option.label }}</span>
+                      <ph-check v-if="option.value === syncIntervalMinutes" class="select-option__check" />
                     </button>
                   </div>
                 </teleport>
               </Transition>
             </div>
-            <!-- 地址输入框 -->
-            <input v-model="webdavHost" placeholder="dav.example.com/remote.php/dav/files/user/" class="input url-input">
           </div>
+          <button class="btn btn--primary btn--input" :disabled="gistValidationState === 'checking'" @click="validateGistAuth">
+            <ph-floppy-disk v-if="gistValidationState !== 'checking'" class="btn__icon" />
+            <ph-circle-notch v-else class="btn__icon btn__icon--spin" />
+            {{ gistValidationState === 'checking' ? '保存中…' : '保存配置' }}
+          </button>
         </div>
-        <div class="field">
-          <label class="field__label">
-            <ph-user class="field__icon" />
-            用户名
-          </label>
-          <input v-model="webdavUsername" placeholder="可选" class="input">
-        </div>
-        <div class="field">
-          <label class="field__label">
-            <ph-key class="field__icon" />
-            密码
-          </label>
-          <div class="input-with-toggle">
-            <input v-model="webdavPassword" :type="showWebdavPassword ? 'text' : 'password'" placeholder="可选" class="input">
-            <button class="input-toggle" type="button" :aria-label="showWebdavPassword ? '隐藏密码' : '显示密码'" @click="showWebdavPassword = !showWebdavPassword">
-              <ph-eye v-if="showWebdavPassword" class="input-toggle__icon" />
-              <ph-eye-slash v-else class="input-toggle__icon" />
-            </button>
-          </div>
-        </div>
-        <div class="field">
-          <label class="field__label">
-            <ph-timer class="field__icon" />
-            自动拉取间隔
-            <button class="link-ghost" type="button" @click.stop="openSyncLog">
-              查看日志 <span v-if="syncLogCount">({{ syncLogCount }})</span>
-            </button>
-          </label>
-          <div ref="intervalDropdownRef" class="select-input" :class="{ 'is-open': intervalDropdownOpen }">
-            <button
-              ref="intervalDropdownTriggerRef"
-              type="button"
-              class="select-input__trigger input"
-              :aria-expanded="intervalDropdownOpen"
-              @click.stop="toggleIntervalDropdown"
-            >
-              <span class="select-input__value">{{ syncIntervalLabel }}</span>
-              <ph-caret-down class="select-input__arrow" />
-            </button>
-            <Transition name="fade">
-              <teleport to="body">
-                <div
-                  v-if="intervalDropdownOpen"
-                  ref="intervalDropdownMenuRef"
-                  class="select-menu"
-                  role="listbox"
-                  :style="intervalDropdownStyle"
+
+        <div v-else key="provider-webdav" class="provider-form">
+          <div class="field">
+            <label class="field__label">
+              <ph-link class="field__icon" />
+              WebDAV 地址
+            </label>
+            <div class="url-input-group">
+              <!-- 协议选择下拉 -->
+              <div ref="protocolDropdownRef" class="protocol-select" :class="{ 'is-open': protocolDropdownOpen }">
+                <button
+                  ref="protocolDropdownTriggerRef"
+                  type="button"
+                  class="protocol-select__trigger"
+                  :aria-expanded="protocolDropdownOpen"
+                  @click.stop="toggleProtocolDropdown"
                 >
-                  <button
-                    v-for="option in syncIntervalOptions"
-                    :key="option.value"
-                    type="button"
-                    class="select-option"
-                    :class="{ 'is-active': option.value === syncIntervalMinutes }"
-                    role="option"
-                    :aria-selected="option.value === syncIntervalMinutes"
-                    @click.stop="selectInterval(option.value)"
-                  >
-                    <span>{{ option.label }}</span>
-                    <ph-check v-if="option.value === syncIntervalMinutes" class="select-option__check" />
-                  </button>
-                </div>
-              </teleport>
-            </Transition>
+                  <span class="protocol-select__value">{{ webdavProtocol }}://</span>
+                  <ph-caret-down class="protocol-select__arrow" />
+                </button>
+                <Transition name="fade">
+                  <teleport to="body">
+                    <div
+                      v-if="protocolDropdownOpen"
+                      ref="protocolDropdownMenuRef"
+                      class="select-menu select-menu--protocol"
+                      role="listbox"
+                      :style="protocolDropdownStyle"
+                    >
+                      <button
+                        v-for="option in protocolOptions"
+                        :key="option.value"
+                        type="button"
+                        class="select-option"
+                        :class="{ 'is-active': option.value === webdavProtocol }"
+                        role="option"
+                        :aria-selected="option.value === webdavProtocol"
+                        @click.stop="selectProtocol(option.value)"
+                      >
+                        {{ option.label }}
+                      </button>
+                    </div>
+                  </teleport>
+                </Transition>
+              </div>
+              <!-- 地址输入框 -->
+              <input v-model="webdavHost" placeholder="dav.example.com/remote.php/dav/files/user/" class="input url-input">
+            </div>
           </div>
+          <div class="field">
+            <label class="field__label">
+              <ph-user class="field__icon" />
+              用户名
+            </label>
+            <input v-model="webdavUsername" placeholder="可选" class="input">
+          </div>
+          <div class="field">
+            <label class="field__label">
+              <ph-key class="field__icon" />
+              密码
+            </label>
+            <div class="input-with-toggle">
+              <input v-model="webdavPassword" :type="showWebdavPassword ? 'text' : 'password'" placeholder="可选" class="input">
+              <button class="input-toggle" type="button" :aria-label="showWebdavPassword ? '隐藏密码' : '显示密码'" @click="showWebdavPassword = !showWebdavPassword">
+                <ph-eye v-if="showWebdavPassword" class="input-toggle__icon" />
+                <ph-eye-slash v-else class="input-toggle__icon" />
+              </button>
+            </div>
+          </div>
+          <div class="field">
+            <label class="field__label">
+              <ph-timer class="field__icon" />
+              自动拉取间隔
+              <button class="link-ghost" type="button" @click.stop="openSyncLog">
+                查看日志 <span v-if="syncLogCount">({{ syncLogCount }})</span>
+              </button>
+            </label>
+            <div ref="intervalDropdownRef" class="select-input" :class="{ 'is-open': intervalDropdownOpen }">
+              <button
+                ref="intervalDropdownTriggerRef"
+                type="button"
+                class="select-input__trigger input"
+                :aria-expanded="intervalDropdownOpen"
+                @click.stop="toggleIntervalDropdown"
+              >
+                <span class="select-input__value">{{ syncIntervalLabel }}</span>
+                <ph-caret-down class="select-input__arrow" />
+              </button>
+              <Transition name="fade">
+                <teleport to="body">
+                  <div
+                    v-if="intervalDropdownOpen"
+                    ref="intervalDropdownMenuRef"
+                    class="select-menu"
+                    role="listbox"
+                    :style="intervalDropdownStyle"
+                  >
+                    <button
+                      v-for="option in syncIntervalOptions"
+                      :key="option.value"
+                      type="button"
+                      class="select-option"
+                      :class="{ 'is-active': option.value === syncIntervalMinutes }"
+                      role="option"
+                      :aria-selected="option.value === syncIntervalMinutes"
+                      @click.stop="selectInterval(option.value)"
+                    >
+                      <span>{{ option.label }}</span>
+                      <ph-check v-if="option.value === syncIntervalMinutes" class="select-option__check" />
+                    </button>
+                  </div>
+                </teleport>
+              </Transition>
+            </div>
+          </div>
+          <button class="btn btn--primary btn--input" :disabled="webdavValidationState === 'checking'" @click="validateWebdavAuth">
+            <ph-floppy-disk v-if="webdavValidationState !== 'checking'" class="btn__icon" />
+            <ph-circle-notch v-else class="btn__icon btn__icon--spin" />
+            {{ webdavValidationState === 'checking' ? '保存中…' : '保存配置' }}
+          </button>
         </div>
-        <button class="btn btn--primary btn--input" :disabled="webdavValidationState === 'checking'" @click="validateWebdavAuth">
-          <ph-floppy-disk v-if="webdavValidationState !== 'checking'" class="btn__icon" />
-          <ph-circle-notch v-else class="btn__icon btn__icon--spin" />
-          {{ webdavValidationState === 'checking' ? '保存中…' : '保存配置' }}
-        </button>
-      </div>
       </Transition>
     </section>
 
@@ -1728,17 +1729,6 @@ watch(protocolDropdownOpen, (open) => {
           </span>
           <span class="action-tile__label">推送云端</span>
         </button>
-      </div>
-    </section>
-
-    <section class="card">
-      <div class="card__header">
-        <ph-bookmarks class="card__icon" />
-        <h2 class="card__title">
-          书签管理
-        </h2>
-      </div>
-      <div class="action-grid">
         <button class="action-tile action-tile--teal" @click="importBookmarks">
           <span class="action-tile__icon"><ph-file-arrow-down /></span>
           <span class="action-tile__label">导入书签</span>
@@ -1750,38 +1740,47 @@ watch(protocolDropdownOpen, (open) => {
       </div>
     </section>
 
-    <section class="card">
-      <div class="card__header">
+    <section class="card" :class="{ 'is-expanded': syncScopeExpanded }">
+      <div class="card__header card__header--collapsible" @click="syncScopeExpanded = !syncScopeExpanded">
         <ph-folder-open class="card__icon" />
         <h2 class="card__title">
           同步范围
         </h2>
-        <button class="btn btn--ghost" :disabled="folderTreeState === 'loading'" @click="loadFolderTree">
-          <ph-arrows-clockwise class="btn__icon" :class="{ 'btn__icon--spin': folderTreeState === 'loading' }" />
-        </button>
-        <button class="btn btn--ghost" @click="saveFolderSelection">
-          <ph-floppy-disk class="btn__icon" />
-          保存
-          <span v-if="hasUnsavedChanges" class="unsaved-dot" />
-        </button>
+        <div class="card__header-actions" @click.stop>
+          <button class="btn btn--ghost" :disabled="folderTreeState === 'loading'" @click="loadFolderTree">
+            <ph-arrows-clockwise class="btn__icon" :class="{ 'btn__icon--spin': folderTreeState === 'loading' }" />
+          </button>
+          <button class="btn btn--ghost" @click="saveFolderSelection">
+            <ph-floppy-disk class="btn__icon" />
+            保存
+            <span v-if="hasUnsavedChanges" class="unsaved-dot" />
+          </button>
+        </div>
+        <ph-caret-down class="card__collapse-icon" :class="{ 'is-rotated': syncScopeExpanded }" />
       </div>
-      <p class="card__hint">
-        选择需要同步的书签文件夹
-      </p>
-      <div v-if="folderTreeState === 'loading' && folderTree.length === 0" class="tree-loading">
-        <ph-circle-notch class="tree-loading__icon" />
-        <span>加载书签…</span>
-      </div>
-      <div v-else-if="folderTreeState === 'error'" class="message" data-state="error">
-        {{ folderTreeMessage }}
-      </div>
-      <div v-else class="tree-container" :class="{ 'tree-container--loading': folderTreeState === 'loading' }">
-        <FolderTree
-          :nodes="folderTree"
-          :selected-ids="Array.from(selectedFolderIds)"
-          @toggle="toggleFolder"
-        />
-      </div>
+      <Transition name="expand">
+        <div v-if="syncScopeExpanded" class="card__collapsible-wrapper">
+          <div class="card__collapsible-content">
+            <p class="card__hint">
+              选择需要同步的书签文件夹
+            </p>
+            <div v-if="folderTreeState === 'loading' && folderTree.length === 0" class="tree-loading">
+              <ph-circle-notch class="tree-loading__icon" />
+              <span>加载书签…</span>
+            </div>
+            <div v-else-if="folderTreeState === 'error'" class="message" data-state="error">
+              {{ folderTreeMessage }}
+            </div>
+            <div v-else class="tree-container" :class="{ 'tree-container--loading': folderTreeState === 'loading' }">
+              <FolderTree
+                :nodes="folderTree"
+                :selected-ids="Array.from(selectedFolderIds)"
+                @toggle="toggleFolder"
+              />
+            </div>
+          </div>
+        </div>
+      </Transition>
     </section>
 
     <!-- Toast 通知 -->
@@ -2305,6 +2304,77 @@ watch(protocolDropdownOpen, (open) => {
   margin: -2px 0 0;
 }
 
+.card__header--collapsible {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.card__header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.card__collapse-icon {
+  --arrow-rotate: rotate(0deg);
+  font-size: 14px;
+  color: var(--accent);
+  transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1), color 0.2s;
+  margin-left: 4px;
+  cursor: pointer;
+  animation: bounce-subtle 2s ease-in-out infinite;
+}
+
+.card__collapse-icon.is-rotated {
+  --arrow-rotate: rotate(180deg);
+}
+
+.card__header--collapsible:hover .card__collapse-icon {
+  color: #fff;
+}
+
+@keyframes bounce-subtle {
+  0%, 100% { transform: var(--arrow-rotate) translateY(0); }
+  50% { transform: var(--arrow-rotate) translateY(3px); }
+}
+
+.card__collapsible-wrapper {
+  overflow: hidden;
+}
+
+.card__collapsible-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 2px 4px;
+}
+
+/* 优化动画效果 */
+.expand-enter-active {
+  transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.expand-leave-active {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.expand-enter-from,
+.expand-leave-to {
+  max-height: 0;
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+.expand-enter-to,
+.expand-leave-from {
+  max-height: 2000px;
+  opacity: 1;
+  transform: translateY(0);
+}
+
 .provider-tabs {
   display: flex;
   gap: 6px;
@@ -2351,7 +2421,6 @@ watch(protocolDropdownOpen, (open) => {
   color: var(--accent);
   transform: translateY(-1px);
 }
-
 
 .provider-form {
   display: flex;
@@ -2856,7 +2925,6 @@ select.input optgroup {
 .input-toggle__icon {
   font-size: 16px;
 }
-
 
 .select-option {
   width: 100%;
