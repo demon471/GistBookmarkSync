@@ -43,7 +43,7 @@ export interface SyncLogEntry {
   id: string
   time: string
   provider: 'gist' | 'webdav'
-  mode: 'upload' | 'download'
+  mode: 'upload' | 'download' | 'random-backup'
   status: 'ok' | 'error'
   summary: string
 }
@@ -84,3 +84,19 @@ export const { data: connectionStatus, dataReady: connectionStatusReady } = useW
 export const { data: lastValidationTime, dataReady: lastValidationTimeReady } = useWebExtensionStorage<number>('last-validation-time', 0)
 export const { data: webdavConnectionStatus, dataReady: webdavConnectionStatusReady } = useWebExtensionStorage<'ok' | 'error' | ''>('webdav-connection-status', '')
 export const { data: webdavLastValidationTime, dataReady: webdavLastValidationTimeReady } = useWebExtensionStorage<number>('webdav-last-validation-time', 0)
+
+// 高级备份配置
+// 是否启用备用同步方式的随机备份
+export const { data: advancedBackupEnabled, dataReady: advancedBackupEnabledReady } = useWebExtensionStorage<boolean>('advanced-backup-enabled', false)
+// 备份使用的 provider（与当前主同步方式相反）
+export const { data: advancedBackupProvider, dataReady: advancedBackupProviderReady } = useWebExtensionStorage<'gist' | 'webdav' | ''>('advanced-backup-provider', '')
+// 随机备份时间区间开始（0-23 小时）
+export const { data: advancedBackupStartHour, dataReady: advancedBackupStartHourReady } = useWebExtensionStorage<number>('advanced-backup-start-hour', 9)
+// 随机备份时间区间结束（0-23 小时）
+export const { data: advancedBackupEndHour, dataReady: advancedBackupEndHourReady } = useWebExtensionStorage<number>('advanced-backup-end-hour', 18)
+// 每天随机备份次数
+export const { data: advancedBackupCount, dataReady: advancedBackupCountReady } = useWebExtensionStorage<number>('advanced-backup-count', 3)
+// 上次随机备份日期（用于判断是否需要重新生成随机时间点）
+export const { data: advancedBackupLastDate, dataReady: advancedBackupLastDateReady } = useWebExtensionStorage<string>('advanced-backup-last-date', '')
+// 今日已完成的备份次数
+export const { data: advancedBackupTodayCount, dataReady: advancedBackupTodayCountReady } = useWebExtensionStorage<number>('advanced-backup-today-count', 0)

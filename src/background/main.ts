@@ -1,5 +1,6 @@
 import { onMessage, sendMessage } from 'webext-bridge/background'
 import type { Tabs } from 'webextension-polyfill'
+import { compressData, decompressData } from '~/logic/compression'
 
 // only on dev mode
 if (import.meta.hot) {
@@ -66,21 +67,21 @@ function getThemeIconPaths(isDark: boolean) {
 
   return isDark
     ? {
-        16: build('logo-dark', 16),
-        32: build('logo-dark', 32),
-        48: build('logo-dark', 48),
-        128: build('logo-dark', 128),
-      }
+      16: build('logo-dark', 16),
+      32: build('logo-dark', 32),
+      48: build('logo-dark', 48),
+      128: build('logo-dark', 128),
+    }
     : {
-        16: build('logo-light', 16),
-        32: build('logo-light', 32),
-        48: build('logo-light', 48),
-        128: build('logo-light', 128),
-      }
+      16: build('logo-light', 16),
+      32: build('logo-light', 32),
+      48: build('logo-light', 48),
+      128: build('logo-light', 128),
+    }
 }
 
 // 监听图标切换请求（跟随系统主题）
-chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message && message.action === 'update-icon' && message.theme) {
     const isDark = message.theme === 'dark'
     const path = getThemeIconPaths(isDark)
@@ -89,8 +90,13 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
     chrome.action.setIcon({ path }, () => {
       if (chrome.runtime.lastError) {
         console.error('Failed to set icon:', chrome.runtime.lastError.message)
+        sendResponse({ ok: false, error: chrome.runtime.lastError.message })
+      }
+      else {
+        sendResponse({ ok: true })
       }
     })
+    return true // 保持异步响应通道开启
   }
 })
 
@@ -103,6 +109,7 @@ let autoSyncTimer: ReturnType<typeof setTimeout> | null = null
 let autoSyncInProgress = false
 let autoSyncPending = false
 const AUTO_SYNC_ALARM_NAME = 'auto-sync-interval'
+const RANDOM_BACKUP_ALARM_NAME = 'random-backup-alarm'
 
 function debugLog(...args: unknown[]) {
   // eslint-disable-next-line no-console
@@ -147,7 +154,7 @@ interface SyncLogEntry {
   id: string
   time: string
   provider: 'gist' | 'webdav'
-  mode: 'upload' | 'download'
+  mode: 'upload' | 'download' | 'random-backup'
   status: 'ok' | 'error'
   summary: string
 }
@@ -360,10 +367,11 @@ async function loadGistBookmarks(token: string, gistId: string, fileName: string
 
   let parsed: { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
   try {
-    parsed = JSON.parse(content) as { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
+    parsed = await decompressData(content) as { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
   }
-  catch {
-    return { ok: false, error: 'Gist file is not valid JSON' }
+  catch (e) {
+    debugLog('Gist parse error:', e)
+    return { ok: false, error: 'Gist file is not valid JSON or Gzip data' }
   }
 
   if (!Array.isArray(parsed.bookmarks))
@@ -636,7 +644,7 @@ async function loadWebDavBookmarks(url: string, username?: string, password?: st
   }
   let parsed: { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
   try {
-    parsed = JSON.parse(content) as { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
+    parsed = await decompressData(content) as { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] }
   }
   catch {
     return { ok: false, error: 'WebDAV 文件不是有效的 JSON' }
@@ -678,20 +686,18 @@ async function applyWebDavDownload(
 }
 
 async function updateWebDavFile(url: string, username: string | undefined, password: string | undefined, nodes: SyncNode[]) {
-  const payload = buildBookmarkPayloadText(nodes)
+  const payload = buildBookmarkPayload(nodes)
   let response: Response
   try {
-    response = await (async () => {
-      const compressed = await buildGzipRequestBody(payload)
-      return await fetch(url, {
-        method: 'PUT',
-        headers: {
-          ...compressed.headers,
-          ...buildWebDavAuthHeaders(username, password),
-        },
-        body: compressed.body,
-      })
-    })()
+    const compressedContent = await compressData(payload)
+    response = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        ...buildWebDavAuthHeaders(username, password),
+        'Content-Type': 'application/json',
+      },
+      body: compressedContent,
+    })
   }
   catch {
     return { ok: false, error: 'WebDAV 推送失败，请检查地址配置' }
@@ -807,13 +813,14 @@ async function saveWebDavVersionSnapshot(
   username: string | undefined,
   password: string | undefined,
   content: string,
+  explicitCount?: number,
 ) {
   const timestamp = new Date().toISOString()
-  const count = countBookmarksFromPayloadText(content)
+  const count = explicitCount ?? countBookmarksFromPayloadText(content)
   const indexResult = await loadWebDavVersionsIndex(baseUrl, username, password)
-  if (!indexResult.ok)
+  if (!indexResult.ok) {
     return indexResult
-
+  }
   const nextSeq = getNextWebDavVersionSeq(indexResult.entries)
   const fileName = `bookmark-${nextSeq}.json`
   const versionPath = buildWebDavVersionFilePath(fileName)
@@ -849,7 +856,7 @@ async function updateGistFile(token: string, gistId: string, fileName: string, n
     {
       files: {
         [fileName]: {
-          content: `${JSON.stringify(payload)}\n`,
+          content: await compressData(payload),
         },
       },
     },
@@ -1206,6 +1213,18 @@ browser.storage.onChanged.addListener((changes, areaName) => {
     const nextValue = Number(changes['sync-interval-minutes'].newValue || 0)
     debugLog('sync-interval-minutes changed to', nextValue)
     void updateSyncIntervalAlarm(Number.isFinite(nextValue) ? nextValue : 0)
+  }
+
+  // 监听高级备份配置变化
+  if (
+    changes['advanced-backup-enabled']
+    || changes['advanced-backup-provider']
+    || changes['advanced-backup-start-hour']
+    || changes['advanced-backup-end-hour']
+    || changes['advanced-backup-count']
+  ) {
+    debugLog('Advanced backup config changed, rescheduling...')
+    void scheduleNextRandomBackup()
   }
 })
 
@@ -1778,8 +1797,27 @@ async function performSync(mode: 'upload' | 'download') {
           return await finalizeSyncResult(provider, mode, { ok: false, error: 'WebDAV 读取失败，请检查地址配置' })
         }
 
-        const payloadText = buildBookmarkPayloadText(localNodes)
-        if (existingText && existingText.trim() === payloadText.trim()) {
+        let remoteJson = ''
+        if (existingText) {
+          try {
+            // 尝试解压现有内容以进行比较
+            const parsed = await decompressData<any>(existingText)
+            if (parsed && parsed.bookmarks) {
+              remoteJson = JSON.stringify(parsed.bookmarks)
+            }
+          }
+          catch {
+            // ignore parse error which means content changed or corrupted
+          }
+        }
+
+        const localJson = JSON.stringify(localNodes)
+
+        // 生成压缩后的 Payload 用于版本快照
+        const fullPayload = buildBookmarkPayload(localNodes)
+        const payloadText = await compressData(fullPayload)
+
+        if (remoteJson && remoteJson === localJson) {
           const timestamp = new Date().toISOString()
           await browser.storage.local.set({
             'webdav-connection-status': 'ok',
@@ -1804,7 +1842,8 @@ async function performSync(mode: 'upload' | 'download') {
           return await finalizeSyncResult(provider, mode, { ok: false, error: updated.error })
         }
 
-        const versionResult = await saveWebDavVersionSnapshot(baseUrl, username, password, payloadText)
+        const localCount = countBookmarks(localNodes)
+        const versionResult = await saveWebDavVersionSnapshot(baseUrl, username, password, payloadText, localCount)
         if (!versionResult.ok) {
           await browser.storage.local.set({
             'webdav-connection-status': 'error',
@@ -1812,8 +1851,6 @@ async function performSync(mode: 'upload' | 'download') {
           })
           return await finalizeSyncResult(provider, mode, { ok: false, error: versionResult.error })
         }
-
-        const localCount = countBookmarks(localNodes)
         const summary = `成功同步 ${localCount} 条书签`
         const timestamp = new Date().toISOString()
 
@@ -1964,6 +2001,387 @@ onMessage('sync-download', async () => {
 onMessage('sync-now', async () => {
   return await performSync('upload')
 })
+
+// =============================================
+// 高级备份（随机备份）功能
+// =============================================
+
+/**
+ * 执行随机备份：使用备用 provider 上传书签
+ * 与主同步不同，随机备份使用配置的备用 provider
+ */
+async function performRandomBackup() {
+  debugLog('performRandomBackup start')
+
+  const stored = await browser.storage.local.get([
+    'advanced-backup-enabled',
+    'advanced-backup-provider',
+    'sync-folder-selection',
+    'github-token',
+    'gist-id',
+    'gist-file-name',
+    'webdav-url',
+    'webdav-username',
+    'webdav-password',
+    'advanced-backup-today-count',
+    'advanced-backup-count',
+  ])
+
+  const enabled = stored['advanced-backup-enabled'] === true
+  const backupProvider = (stored['advanced-backup-provider'] as string | undefined) || ''
+
+  if (!enabled || !backupProvider) {
+    debugLog('Random backup skipped: not enabled or no backup provider')
+    return { ok: false, error: '随机备份未启用或未配置备份方式' }
+  }
+
+  // 检查今日备份次数是否已达上限
+  const todayCount = Number(stored['advanced-backup-today-count']) || 0
+  const targetCount = (stored['advanced-backup-count'] as number | undefined) || 3
+  if (todayCount >= targetCount) {
+    debugLog('Random backup skipped: daily limit reached', { todayCount, targetCount })
+    return { ok: false, error: '今日备份次数已达上限' }
+  }
+
+  const selectedFolderIds = parseSelectedFolderIds(stored['sync-folder-selection'])
+  const provider = backupProvider as 'gist' | 'webdav'
+
+  try {
+    // 加载本地书签
+    const localResult = await loadLocalNodes(selectedFolderIds)
+    if (!localResult.ok) {
+      return await finalizeRandomBackupResult(provider, { ok: false, error: localResult.error })
+    }
+
+    const { localNodes } = localResult
+
+    if (provider === 'webdav') {
+      // 使用 WebDAV 备份
+      const baseUrl = (stored['webdav-url'] as string | undefined)?.trim()
+      const username = (stored['webdav-username'] as string | undefined) || ''
+      const password = (stored['webdav-password'] as string | undefined) || ''
+
+      if (!baseUrl) {
+        return await finalizeRandomBackupResult(provider, { ok: false, error: 'WebDAV 未配置' })
+      }
+
+      const filePath = resolveWebDavFilePath('')
+      const fileUrl = buildWebDavFileUrl(baseUrl, filePath)
+
+      const ensureResult = await ensureWebDavDirectories(baseUrl, filePath, username, password)
+      if (!ensureResult.ok) {
+        return await finalizeRandomBackupResult(provider, { ok: false, error: ensureResult.error })
+      }
+
+      const updated = await updateWebDavFile(fileUrl, username, password, localNodes)
+      if (!updated.ok) {
+        return await finalizeRandomBackupResult(provider, { ok: false, error: updated.error })
+      }
+
+      const fullPayload = buildBookmarkPayload(localNodes)
+      const payloadText = await compressData(fullPayload)
+      const localCount = countBookmarks(localNodes)
+      await saveWebDavVersionSnapshot(baseUrl, username, password, payloadText, localCount)
+
+
+      const summary = `随机备份成功 ${localCount} 条书签 (WebDAV)`
+      const timestamp = new Date().toISOString()
+
+      // 更新今日备份计数
+      await browser.storage.local.set({
+        'advanced-backup-today-count': todayCount + 1,
+      })
+
+      return await finalizeRandomBackupResult(provider, { ok: true, summary, timestamp })
+    }
+    else {
+      // 使用 Gist 备份
+      const token = (stored['github-token'] as string | undefined)?.trim()
+      const gistId = (stored['gist-id'] as string | undefined)?.trim()
+      const fileName = (stored['gist-file-name'] as string | undefined)?.trim()
+
+      if (!token || !gistId || !fileName) {
+        return await finalizeRandomBackupResult(provider, { ok: false, error: 'Gist 未配置' })
+      }
+
+      const updated = await updateGistFile(token, gistId, fileName, localNodes)
+      if (!updated) {
+        return await finalizeRandomBackupResult(provider, { ok: false, error: 'Gist 更新失败' })
+      }
+
+      const localCount = countBookmarks(localNodes)
+      const summary = `随机备份成功 ${localCount} 条书签 (Gist)`
+      const timestamp = new Date().toISOString()
+
+      // 更新今日备份计数
+      await browser.storage.local.set({
+        'advanced-backup-today-count': todayCount + 1,
+      })
+
+      return await finalizeRandomBackupResult(provider, { ok: true, summary, timestamp })
+    }
+  }
+  catch (error) {
+    const message = error instanceof Error ? error.message : '随机备份失败'
+    return await finalizeRandomBackupResult(provider, { ok: false, error: message })
+  }
+}
+
+/**
+ * 记录随机备份日志
+ */
+async function finalizeRandomBackupResult(
+  provider: 'gist' | 'webdav',
+  result: { ok: true, summary?: string, timestamp?: string } | { ok: false, error?: string },
+) {
+  const entry: SyncLogEntry = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    time: 'timestamp' in result && result.timestamp ? result.timestamp : new Date().toISOString(),
+    provider,
+    mode: 'random-backup',
+    status: result.ok ? 'ok' : 'error',
+    summary: result.ok ? (result.summary || '随机备份成功') : (result.error || '随机备份失败'),
+  }
+  await appendSyncLog(entry)
+  debugLog('Random backup finalized', entry)
+  return result
+}
+
+/**
+ * 检查是否在备份时间区间内
+ */
+function isInBackupTimeRange(startHour: number, endHour: number): boolean {
+  const now = new Date()
+  const currentHour = now.getHours()
+  if (startHour <= endHour) {
+    return currentHour >= startHour && currentHour < endHour
+  }
+  else {
+    // 跨夜情况，如 22:00-06:00
+    return currentHour >= startHour || currentHour < endHour
+  }
+}
+
+/**
+ * 计算下次随机备份的时间延迟（毫秒）
+ */
+/**
+ * 计算下次随机备份的时间延迟（毫秒）
+ * 根据剩余时间和剩余次数动态分配
+ */
+function calculateNextRandomBackupDelay(endHour: number, remainingCount: number): number {
+  const now = new Date()
+  let targetEnd = new Date(now)
+  targetEnd.setHours(endHour, 0, 0, 0)
+
+  // 如果目标结束时间在过去，说明跨夜了（或者异常），需要在下一天
+  // 但前面已保证 isInBackupTimeRange，所以如果是跨夜区间（如22-06），当前23点，结束06点，06点是明天。
+  if (targetEnd.getTime() <= now.getTime()) {
+    targetEnd.setDate(targetEnd.getDate() + 1)
+  }
+
+  const remainingMinutes = (targetEnd.getTime() - now.getTime()) / 60000
+  if (remainingMinutes <= 5) {
+    return 60 * 1000 // 剩余时间很少，1分钟后执行
+  }
+
+  const safeCount = Math.max(1, remainingCount)
+  const intervalMinutes = remainingMinutes / safeCount
+
+  // 在分配的时间片内随机
+  const delayMinutes = Math.random() * intervalMinutes
+
+  return Math.max(60 * 1000, delayMinutes * 60 * 1000)
+}
+
+/**
+ * 设置下一次随机备份的 alarm
+ */
+async function scheduleNextRandomBackup() {
+  const stored = await browser.storage.local.get([
+    'advanced-backup-enabled',
+    'advanced-backup-provider',
+    'advanced-backup-start-hour',
+    'advanced-backup-end-hour',
+    'advanced-backup-count',
+    'advanced-backup-today-count',
+    'advanced-backup-last-date',
+  ])
+
+  const enabled = stored['advanced-backup-enabled'] === true
+  const backupProvider = stored['advanced-backup-provider'] as string | undefined
+
+  if (!enabled || !backupProvider) {
+    debugLog('Random backup scheduling skipped: not enabled')
+    await browser.alarms?.clear(RANDOM_BACKUP_ALARM_NAME)
+    return
+  }
+
+  const startHour = (stored['advanced-backup-start-hour'] as number | undefined) ?? 9
+  const endHour = (stored['advanced-backup-end-hour'] as number | undefined) ?? 18
+  const dailyCount = (stored['advanced-backup-count'] as number | undefined) || 3
+  const todayCount = Number(stored['advanced-backup-today-count']) || 0
+  const lastDate = (stored['advanced-backup-last-date'] as string | undefined) || ''
+
+  // 检查是否需要重置今日计数（新的一天）
+  const today = new Date().toISOString().slice(0, 10)
+  if (lastDate !== today) {
+    await browser.storage.local.set({
+      'advanced-backup-last-date': today,
+      'advanced-backup-today-count': 0,
+    })
+    debugLog('Random backup: new day, reset today count')
+  }
+
+  const actualTodayCount = lastDate === today ? todayCount : 0
+
+  // 如果今日备份次数已达上限，不调度
+  if (actualTodayCount >= dailyCount) {
+    debugLog('Random backup scheduling skipped: daily limit reached')
+    await browser.alarms?.clear(RANDOM_BACKUP_ALARM_NAME)
+    return
+  }
+
+  // 如果不在时间区间内，计算到开始时间的延迟
+  if (!isInBackupTimeRange(startHour, endHour)) {
+    const now = new Date()
+    const currentHour = now.getHours()
+    let hoursUntilStart: number
+
+    if (currentHour < startHour) {
+      hoursUntilStart = startHour - currentHour
+    }
+    else {
+      hoursUntilStart = 24 - currentHour + startHour
+    }
+
+    const delayMs = hoursUntilStart * 60 * 60 * 1000 + Math.random() * 30 * 60 * 1000
+    debugLog('Random backup: not in time range, scheduling for start', { hoursUntilStart })
+    await browser.alarms?.create(RANDOM_BACKUP_ALARM_NAME, { delayInMinutes: delayMs / 60000 })
+    return
+  }
+
+  // 在时间区间内，计算下次备份时间
+  // 修正：基于剩余时间计算，而非全天时间
+  const delayMs = calculateNextRandomBackupDelay(endHour, dailyCount - actualTodayCount)
+  debugLog('Random backup: scheduling next backup', { delayMinutes: delayMs / 60000 })
+  await browser.alarms?.create(RANDOM_BACKUP_ALARM_NAME, { delayInMinutes: delayMs / 60000 })
+}
+
+// 监听 alarm 触发
+browser.alarms?.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === RANDOM_BACKUP_ALARM_NAME) {
+    debugLog('Random backup alarm triggered')
+
+    const stored = await browser.storage.local.get([
+      'advanced-backup-enabled',
+      'advanced-backup-start-hour',
+      'advanced-backup-end-hour',
+    ])
+
+    const enabled = stored['advanced-backup-enabled'] === true
+    const startHour = (stored['advanced-backup-start-hour'] as number | undefined) ?? 9
+    const endHour = (stored['advanced-backup-end-hour'] as number | undefined) ?? 18
+
+    if (enabled && isInBackupTimeRange(startHour, endHour)) {
+      await performRandomBackup()
+    }
+
+    // 调度下一次备份
+    await scheduleNextRandomBackup()
+  }
+})
+
+// 立即执行随机备份
+onMessage('random-backup-now', async () => {
+  const stored = await browser.storage.local.get([
+    'advanced-backup-enabled',
+    'advanced-backup-provider',
+  ])
+
+  const enabled = stored['advanced-backup-enabled'] === true
+  const backupProvider = stored['advanced-backup-provider'] as string | undefined
+
+  if (!enabled || !backupProvider) {
+    return { ok: false, error: '随机备份未启用或未配置备份方式' }
+  }
+
+  return await performRandomBackup()
+})
+
+// 获取高级备份配置
+onMessage('get-advanced-backup-config', async () => {
+  const stored = await browser.storage.local.get([
+    'advanced-backup-enabled',
+    'advanced-backup-provider',
+    'advanced-backup-start-hour',
+    'advanced-backup-end-hour',
+    'advanced-backup-count',
+    'advanced-backup-today-count',
+    'advanced-backup-last-date',
+  ])
+
+  const today = new Date().toISOString().slice(0, 10)
+  const lastDate = (stored['advanced-backup-last-date'] as string | undefined) || ''
+  const todayCount = lastDate === today ? (Number(stored['advanced-backup-today-count']) || 0) : 0
+
+  return {
+    ok: true,
+    config: {
+      enabled: stored['advanced-backup-enabled'] === true,
+      provider: (stored['advanced-backup-provider'] as string | undefined) || '',
+      startHour: (stored['advanced-backup-start-hour'] as number | undefined) ?? 9,
+      endHour: (stored['advanced-backup-end-hour'] as number | undefined) ?? 18,
+      count: (stored['advanced-backup-count'] as number | undefined) || 3,
+      todayCount,
+    },
+  }
+})
+
+// 更新高级备份配置
+onMessage('update-advanced-backup-config', async ({ data }) => {
+  const config = data as {
+    enabled?: boolean
+    provider?: string
+    startHour?: number
+    endHour?: number
+    count?: number
+  } | undefined
+
+  if (!config) {
+    return { ok: false, error: '无效的配置参数' }
+  }
+
+  const updates: Record<string, unknown> = {}
+
+  if (typeof config.enabled === 'boolean') {
+    updates['advanced-backup-enabled'] = config.enabled
+  }
+  if (typeof config.provider === 'string') {
+    updates['advanced-backup-provider'] = config.provider
+  }
+  if (typeof config.startHour === 'number') {
+    updates['advanced-backup-start-hour'] = Math.max(0, Math.min(23, config.startHour))
+  }
+  if (typeof config.endHour === 'number') {
+    updates['advanced-backup-end-hour'] = Math.max(0, Math.min(23, config.endHour))
+  }
+  if (typeof config.count === 'number') {
+    updates['advanced-backup-count'] = Math.max(1, Math.min(10, config.count))
+  }
+
+  await browser.storage.local.set(updates)
+  debugLog('Advanced backup config updated', updates)
+
+  // 重新调度随机备份
+  await scheduleNextRandomBackup()
+
+  return { ok: true }
+})
+
+// 启动时调度随机备份
+void scheduleNextRandomBackup()
+
 
 onMessage('webdav-list-versions', async () => {
   const stored = await browser.storage.local.get([

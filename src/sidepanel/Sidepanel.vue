@@ -72,6 +72,24 @@ const hiddenPagesSearch = ref('')
 const hiddenPagesPage = ref(1)
 const hiddenPagesPerPage = 10
 
+// 高级设置
+const advancedSettingsVisible = ref(false)
+const advancedSettingsLoading = ref(false)
+const advancedSettingsSaving = ref(false)
+const advancedBackupEnabled = ref(false)
+const advancedBackupProvider = ref<'gist' | 'webdav' | ''>('')
+const advancedBackupStartHour = ref(9)
+const advancedBackupEndHour = ref(18)
+const advancedBackupCount = ref(3)
+const advancedBackupTodayCount = ref(0)
+const advancedBackupState = ref<'idle' | 'syncing' | 'done' | 'error'>('idle')
+
+// 高级设置下拉菜单
+const startHourDropdownOpen = ref(false)
+const endHourDropdownOpen = ref(false)
+const countDropdownOpen = ref(false)
+
+
 // WebDAV 协议选择
 const webdavProtocol = ref<'https' | 'http'>('https')
 const protocolDropdownOpen = ref(false)
@@ -927,6 +945,11 @@ function exportConfig() {
     webdavPassword: webdavPassword.value,
     syncIntervalMinutes: syncIntervalMinutes.value,
     syncFolderSelection: Array.from(selectedFolderIds.value),
+    advancedBackupEnabled: advancedBackupEnabled.value,
+    advancedBackupProvider: advancedBackupProvider.value,
+    advancedBackupStartHour: advancedBackupStartHour.value,
+    advancedBackupEndHour: advancedBackupEndHour.value,
+    advancedBackupCount: advancedBackupCount.value,
     hiddenHosts,
   }
   const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' })
@@ -976,6 +999,16 @@ function importConfig() {
         syncFolderSelection.value = config.syncFolderSelection
         selectedFolderIds.value = new Set(config.syncFolderSelection)
       }
+      if (typeof config.advancedBackupEnabled === 'boolean')
+        advancedBackupEnabled.value = config.advancedBackupEnabled
+      if (config.advancedBackupProvider === 'gist' || config.advancedBackupProvider === 'webdav')
+        advancedBackupProvider.value = config.advancedBackupProvider
+      if (typeof config.advancedBackupStartHour === 'number')
+        advancedBackupStartHour.value = config.advancedBackupStartHour
+      if (typeof config.advancedBackupEndHour === 'number')
+        advancedBackupEndHour.value = config.advancedBackupEndHour
+      if (typeof config.advancedBackupCount === 'number')
+        advancedBackupCount.value = config.advancedBackupCount
       const storagePayload: Record<string, unknown> = {}
       if (config.syncProvider === 'webdav' || config.syncProvider === 'gist')
         storagePayload['sync-provider'] = config.syncProvider
@@ -995,6 +1028,17 @@ function importConfig() {
         storagePayload['sync-interval-minutes'] = config.syncIntervalMinutes
       if (Array.isArray(config.syncFolderSelection))
         storagePayload['sync-folder-selection'] = config.syncFolderSelection
+
+      if (typeof config.advancedBackupEnabled === 'boolean')
+        storagePayload['advanced-backup-enabled'] = config.advancedBackupEnabled
+      if (config.advancedBackupProvider === 'gist' || config.advancedBackupProvider === 'webdav')
+        storagePayload['advanced-backup-provider'] = config.advancedBackupProvider
+      if (typeof config.advancedBackupStartHour === 'number')
+        storagePayload['advanced-backup-start-hour'] = config.advancedBackupStartHour
+      if (typeof config.advancedBackupEndHour === 'number')
+        storagePayload['advanced-backup-end-hour'] = config.advancedBackupEndHour
+      if (typeof config.advancedBackupCount === 'number')
+        storagePayload['advanced-backup-count'] = config.advancedBackupCount
 
       // 导入隐藏的域名列表 - 合并模式，不会覆盖现有的
       // browser.storage.local.set() 只会更新/添加 keys，不会删除其他 keys
@@ -1220,6 +1264,182 @@ function onHiddenPagesSearchChange() {
 
 // 初始化时加载隐藏页面列表
 void loadHiddenPages()
+
+// =============================================
+// 高级设置（随机备份）功能
+// =============================================
+
+/**
+ * 获取备用 provider（与当前主 provider 相反）
+ */
+const alternateProvider = computed(() => {
+  return syncProvider.value === 'webdav' ? 'gist' : 'webdav'
+})
+
+/**
+ * 检查备用 provider 是否已配置
+ */
+const isAlternateProviderConfigured = computed(() => {
+  if (alternateProvider.value === 'gist') {
+    return !!(githubToken.value?.trim() && gistId.value?.trim())
+  }
+  else {
+    return !!webdavUrl.value?.trim()
+  }
+})
+
+/**
+ * 打开高级设置弹窗
+ */
+async function openAdvancedSettings() {
+  advancedSettingsVisible.value = true
+  await loadAdvancedBackupConfig()
+}
+
+/**
+ * 加载高级备份配置
+ */
+async function loadAdvancedBackupConfig() {
+  advancedSettingsLoading.value = true
+  try {
+    const result = await safeSendMessage('get-advanced-backup-config', null, 'background')
+    if (result.ok && result.config) {
+      advancedBackupEnabled.value = result.config.enabled
+      // 如果没有配置 provider，默认使用备用 provider
+      advancedBackupProvider.value = result.config.provider || alternateProvider.value
+      advancedBackupStartHour.value = result.config.startHour
+      advancedBackupEndHour.value = result.config.endHour
+      advancedBackupCount.value = result.config.count
+      advancedBackupTodayCount.value = result.config.todayCount
+    }
+  }
+  catch (error) {
+    console.error('Failed to load advanced backup config', error)
+  }
+  finally {
+    advancedSettingsLoading.value = false
+  }
+}
+
+/**
+ * 保存高级备份配置
+ */
+async function saveAdvancedBackupConfig() {
+  advancedSettingsSaving.value = true
+  try {
+    const result = await safeSendMessage('update-advanced-backup-config', {
+      enabled: advancedBackupEnabled.value,
+      provider: advancedBackupProvider.value,
+      startHour: advancedBackupStartHour.value,
+      endHour: advancedBackupEndHour.value,
+      count: advancedBackupCount.value,
+    }, 'background')
+    if (result.ok) {
+      showToast('高级设置已保存', 'success')
+    }
+    else {
+      showToast(result.error || '保存失败', 'error')
+    }
+  }
+  catch (error) {
+    showToast('保存失败', 'error')
+  }
+  finally {
+    advancedSettingsSaving.value = false
+  }
+}
+
+/**
+ * 立即执行随机备份
+ */
+async function performRandomBackupNow() {
+  if (!advancedBackupProvider.value) {
+    showToast('请先选择备份方式', 'error')
+    return
+  }
+
+  // 先保存配置
+  await saveAdvancedBackupConfig()
+
+  advancedBackupState.value = 'syncing'
+  try {
+    const result = await safeSendMessage('random-backup-now', null, 'background')
+    if (result.ok) {
+      advancedBackupState.value = 'done'
+      showToast(result.summary || '备份成功', 'success')
+      // 刷新今日备份次数
+      await loadAdvancedBackupConfig()
+    }
+    else {
+      advancedBackupState.value = 'error'
+      showToast(result.error || '备份失败', 'error')
+    }
+  }
+  catch (error) {
+    advancedBackupState.value = 'error'
+    showToast(error instanceof Error ? error.message : '备份失败', 'error')
+  }
+}
+
+/**
+ * 格式化小时显示
+ */
+function formatHour(hour: number) {
+  return `${String(hour).padStart(2, '0')}:00`
+}
+
+/**
+ * 小时选项列表
+ */
+const hourOptions = Array.from({ length: 24 }, (_, i) => ({
+  value: i,
+  label: formatHour(i),
+}))
+
+/**
+ * 备份次数选项
+ */
+const backupCountOptions = [
+  { value: 1, label: '1 次' },
+  { value: 2, label: '2 次' },
+  { value: 3, label: '3 次' },
+  { value: 5, label: '5 次' },
+  { value: 10, label: '10 次' },
+]
+
+/**
+ * 选择开始小时
+ */
+function selectStartHour(hour: number) {
+  advancedBackupStartHour.value = hour
+  startHourDropdownOpen.value = false
+}
+
+/**
+ * 选择结束小时
+ */
+function selectEndHour(hour: number) {
+  advancedBackupEndHour.value = hour
+  endHourDropdownOpen.value = false
+}
+
+/**
+ * 选择备份次数
+ */
+function selectBackupCount(count: number) {
+  advancedBackupCount.value = count
+  countDropdownOpen.value = false
+}
+
+/**
+ * 关闭所有高级设置下拉菜单
+ */
+function closeAllAdvancedDropdowns() {
+  startHourDropdownOpen.value = false
+  endHourDropdownOpen.value = false
+  countDropdownOpen.value = false
+}
+
 
 function collectFolderIds(nodes: FolderNode[]) {
   const ids: string[] = []
@@ -1470,6 +1690,9 @@ watch(protocolDropdownOpen, (open) => {
         <h2 class="card__title">
           连接配置
         </h2>
+        <button class="icon-btn card__action-btn" title="高级设置" @click="openAdvancedSettings">
+          <ph-gear-fine weight="bold" />
+        </button>
       </div>
       <div class="provider-tabs" :data-provider="syncProvider">
         <span class="provider-tabs__indicator" />
@@ -1729,6 +1952,7 @@ watch(protocolDropdownOpen, (open) => {
           </span>
           <span class="action-tile__label">推送云端</span>
         </button>
+
         <button class="action-tile action-tile--teal" @click="importBookmarks">
           <span class="action-tile__icon"><ph-file-arrow-down /></span>
           <span class="action-tile__label">导入书签</span>
@@ -1739,6 +1963,8 @@ watch(protocolDropdownOpen, (open) => {
         </button>
       </div>
     </section>
+
+
 
     <section class="card" :class="{ 'is-expanded': syncScopeExpanded }">
       <div class="card__header card__header--collapsible" @click="syncScopeExpanded = !syncScopeExpanded">
@@ -1801,6 +2027,9 @@ watch(protocolDropdownOpen, (open) => {
             <h3 class="modal__title">
               导出书签
             </h3>
+            <button class="modal__close" @click="exportModalVisible = false">
+              <ph-x />
+            </button>
           </div>
           <div class="modal__body">
             <label class="radio-option">
@@ -1841,6 +2070,9 @@ watch(protocolDropdownOpen, (open) => {
             <h3 class="modal__title">
               历史版本
             </h3>
+            <button class="modal__close" @click="webdavVersionsVisible = false">
+              <ph-x />
+            </button>
           </div>
           <div class="modal__body">
             <div v-if="webdavVersionsState === 'loading' && webdavVersions.length === 0" class="tree-loading">
@@ -1899,6 +2131,9 @@ watch(protocolDropdownOpen, (open) => {
             <h3 class="modal__title">
               同步日志
             </h3>
+            <button class="modal__close" @click="syncLogVisible = false">
+              <ph-x />
+            </button>
           </div>
           <div class="modal__body">
             <div v-if="!syncLogReady" class="tree-loading">
@@ -1922,7 +2157,7 @@ watch(protocolDropdownOpen, (open) => {
                   </div>
                 </div>
                 <div class="sync-log-meta">
-                  <span class="sync-log-badge" :data-mode="item.mode">{{ item.mode === 'upload' ? '推送' : '拉取' }}</span>
+                  <span class="sync-log-badge" :data-mode="item.mode">{{ item.mode === 'upload' ? '推送' : item.mode === 'download' ? '拉取' : '随机' }}</span>
                   <span class="sync-log-time">
                     {{ formatSyncLogTime(item.time) }}
                   </span>
@@ -1951,6 +2186,9 @@ watch(protocolDropdownOpen, (open) => {
             <h3 class="modal__title">
               隐藏页面管理
             </h3>
+            <button class="modal__close" @click="hiddenPagesVisible = false">
+              <ph-x />
+            </button>
           </div>
           <div class="modal__body">
             <!-- 搜索框 -->
@@ -2014,6 +2252,204 @@ watch(protocolDropdownOpen, (open) => {
             <button class="btn btn--ghost" @click="hiddenPagesVisible = false">
               关闭
             </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- 高级设置弹窗 -->
+    <Transition name="modal">
+      <div v-if="advancedSettingsVisible" class="modal-overlay" @click.self="advancedSettingsVisible = false; closeAllAdvancedDropdowns()">
+        <div class="modal modal--advanced" @click="closeAllAdvancedDropdowns">
+          <div class="modal__header">
+            <ph-gear-fine class="modal__icon" />
+            <h3 class="modal__title">
+              高级设置
+            </h3>
+            <button class="modal__close" @click="advancedSettingsVisible = false; closeAllAdvancedDropdowns()">
+              <ph-x />
+            </button>
+          </div>
+          <div class="modal__body">
+            <div v-if="advancedSettingsLoading" class="tree-loading">
+              <ph-circle-notch class="tree-loading__icon" />
+              <span>加载配置…</span>
+            </div>
+            <template v-else>
+              <!-- 备用备份说明 -->
+              <div class="advanced-hint">
+                <ph-info class="advanced-hint__icon" />
+                <span>
+                  当前使用 <strong>{{ syncProvider === 'webdav' ? 'WebDAV' : 'Gist' }}</strong> 同步，
+                  可开启 <strong>{{ alternateProvider === 'webdav' ? 'WebDAV' : 'Gist' }}</strong> 进行随机备份。
+                </span>
+              </div>
+
+              <!-- 启用开关 -->
+              <div class="advanced-field">
+                <label class="advanced-field__label">
+                  启用随机备份
+                  <span v-if="!isAlternateProviderConfigured" class="advanced-field__tip">(需先配置)</span>
+                </label>
+                <label class="toggle" :class="{ 'toggle--disabled': !isAlternateProviderConfigured }">
+                  <input
+                    v-model="advancedBackupEnabled"
+                    type="checkbox"
+                    class="toggle__input"
+                    :disabled="!isAlternateProviderConfigured"
+                  >
+                  <span class="toggle__slider" />
+                </label>
+              </div>
+
+              <!-- 备份方式 -->
+              <div class="advanced-field">
+                <label class="advanced-field__label">备份目标</label>
+                <div class="advanced-field__value">
+                  <span
+                    class="provider-badge"
+                    :class="[`provider-badge--${alternateProvider}`, { 'provider-badge--disabled': !isAlternateProviderConfigured }]"
+                  >
+                    <ph-github-logo v-if="alternateProvider === 'gist'" class="provider-badge__icon" />
+                    <ph-cloud v-else class="provider-badge__icon" />
+                    {{ alternateProvider === 'webdav' ? 'WebDAV' : 'Gist' }}
+                    <span v-if="!isAlternateProviderConfigured" class="provider-badge__status">未配置</span>
+                  </span>
+                </div>
+              </div>
+
+              <!-- 时间区间 -->
+              <div class="advanced-field">
+                <label class="advanced-field__label">时间区间</label>
+                <div class="time-range">
+                  <!-- 开始时间下拉菜单 -->
+                  <div class="adv-dropdown" @click.stop>
+                    <button
+                      class="adv-dropdown__trigger"
+                      :class="{ 'is-open': startHourDropdownOpen }"
+                      @click="startHourDropdownOpen = !startHourDropdownOpen; endHourDropdownOpen = false; countDropdownOpen = false"
+                    >
+                      <span>{{ formatHour(advancedBackupStartHour) }}</span>
+                      <ph-caret-down class="adv-dropdown__caret" />
+                    </button>
+                    <Transition name="dropdown">
+                      <div v-if="startHourDropdownOpen" class="adv-dropdown__menu adv-dropdown__menu--scroll">
+                        <button
+                          v-for="opt in hourOptions"
+                          :key="opt.value"
+                          class="adv-dropdown__option"
+                          :class="{ 'is-selected': opt.value === advancedBackupStartHour }"
+                          @click="selectStartHour(opt.value)"
+                        >
+                          {{ opt.label }}
+                          <ph-check v-if="opt.value === advancedBackupStartHour" class="adv-dropdown__check" />
+                        </button>
+                      </div>
+                    </Transition>
+                  </div>
+                  <span class="time-range__sep">至</span>
+                  <!-- 结束时间下拉菜单 -->
+                  <div class="adv-dropdown" @click.stop>
+                    <button
+                      class="adv-dropdown__trigger"
+                      :class="{ 'is-open': endHourDropdownOpen }"
+                      @click="endHourDropdownOpen = !endHourDropdownOpen; startHourDropdownOpen = false; countDropdownOpen = false"
+                    >
+                      <span>{{ formatHour(advancedBackupEndHour) }}</span>
+                      <ph-caret-down class="adv-dropdown__caret" />
+                    </button>
+                    <Transition name="dropdown">
+                      <div v-if="endHourDropdownOpen" class="adv-dropdown__menu adv-dropdown__menu--scroll">
+                        <button
+                          v-for="opt in hourOptions"
+                          :key="opt.value"
+                          class="adv-dropdown__option"
+                          :class="{ 'is-selected': opt.value === advancedBackupEndHour }"
+                          @click="selectEndHour(opt.value)"
+                        >
+                          {{ opt.label }}
+                          <ph-check v-if="opt.value === advancedBackupEndHour" class="adv-dropdown__check" />
+                        </button>
+                      </div>
+                    </Transition>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 每日备份次数 -->
+              <div class="advanced-field">
+                <label class="advanced-field__label">每日备份次数</label>
+                <div class="adv-dropdown" @click.stop>
+                  <button
+                    class="adv-dropdown__trigger"
+                    :class="{ 'is-open': countDropdownOpen }"
+                    @click="countDropdownOpen = !countDropdownOpen; startHourDropdownOpen = false; endHourDropdownOpen = false"
+                  >
+                    <span>{{ advancedBackupCount }} 次</span>
+                    <ph-caret-down class="adv-dropdown__caret" />
+                  </button>
+                  <Transition name="dropdown">
+                    <div v-if="countDropdownOpen" class="adv-dropdown__menu">
+                      <button
+                        v-for="opt in backupCountOptions"
+                        :key="opt.value"
+                        class="adv-dropdown__option"
+                        :class="{ 'is-selected': opt.value === advancedBackupCount }"
+                        @click="selectBackupCount(opt.value)"
+                      >
+                        {{ opt.label }}
+                        <ph-check v-if="opt.value === advancedBackupCount" class="adv-dropdown__check" />
+                      </button>
+                    </div>
+                  </Transition>
+                </div>
+              </div>
+
+              <!-- 今日备份统计 -->
+              <div class="advanced-stats">
+                <div class="advanced-stats__ring">
+                  <svg viewBox="0 0 36 36" class="advanced-stats__svg">
+                    <circle cx="18" cy="18" r="15.5" fill="none" stroke="var(--card-border)" stroke-width="3" />
+                    <circle
+                      cx="18" cy="18" r="15.5" fill="none"
+                      stroke="var(--accent)"
+                      stroke-width="3"
+                      stroke-linecap="round"
+                      :stroke-dasharray="`${(advancedBackupTodayCount / advancedBackupCount) * 97.5} 97.5`"
+                      transform="rotate(-90 18 18)"
+                    />
+                  </svg>
+                  <div class="advanced-stats__text">
+                    <span class="advanced-stats__value">{{ advancedBackupTodayCount }}</span>
+                    <span class="advanced-stats__sep">/</span>
+                    <span class="advanced-stats__total">{{ advancedBackupCount }}</span>
+                  </div>
+                </div>
+                <span class="advanced-stats__label">今日已备份</span>
+              </div>
+
+            </template>
+          </div>
+          <div class="modal__footer modal__footer--advanced">
+            <button
+              class="btn btn--accent btn--wide"
+              :disabled="!isAlternateProviderConfigured || advancedBackupState === 'syncing'"
+              @click="performRandomBackupNow"
+            >
+              <ph-cloud-arrow-up v-if="advancedBackupState !== 'syncing'" class="btn__icon" />
+              <ph-circle-notch v-else class="btn__icon btn__icon--spin" />
+              {{ advancedBackupState === 'syncing' ? '备份中…' : '立即备份' }}
+            </button>
+            <div class="modal__footer-actions">
+              <button class="btn btn--primary" :disabled="advancedSettingsLoading || advancedSettingsSaving" @click="saveAdvancedBackupConfig">
+                <ph-circle-notch v-if="advancedSettingsSaving" class="btn__icon btn__icon--spin" />
+                <ph-floppy-disk v-else class="btn__icon" />
+                {{ advancedSettingsSaving ? '保存中' : '保存' }}
+              </button>
+              <button class="btn btn--ghost" @click="advancedSettingsVisible = false; closeAllAdvancedDropdowns()">
+                关闭
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -2302,6 +2738,20 @@ watch(protocolDropdownOpen, (open) => {
   font-size: 11px;
   color: var(--ink-muted);
   margin: -2px 0 0;
+}
+
+.card__action-btn {
+  color: var(--accent); /* 使用强调色 */
+  font-size: 18px;      /* 加大图标尺寸 */
+  opacity: 0.85;
+  width: 28px;
+  height: 28px;
+}
+
+.card__action-btn:hover {
+  opacity: 1;
+  background: rgba(232, 93, 59, 0.1);
+  color: var(--accent);
 }
 
 .card__header--collapsible {
@@ -2650,6 +3100,12 @@ watch(protocolDropdownOpen, (open) => {
   color: var(--accent);
   border-color: rgba(232, 93, 59, 0.4);
   background: rgba(232, 93, 59, 0.12);
+}
+
+.sync-log-badge[data-mode="random-backup"] {
+  color: #8b5cf6;
+  border-color: rgba(139, 92, 246, 0.4);
+  background: rgba(139, 92, 246, 0.12);
 }
 
 .sync-log-time {
@@ -3447,6 +3903,48 @@ select.input optgroup {
   font-weight: 600;
   margin: 0;
   color: var(--ink);
+  flex: 1; /* 让标题占据剩余空间，把关闭按钮推到右边 */
+}
+
+/* 通用图标按钮 */
+.icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--ink-muted);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.icon-btn:hover {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--ink);
+}
+
+.modal__close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--ink-muted);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.modal__close:hover {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--ink);
 }
 
 .modal__body {
@@ -3777,4 +4275,412 @@ select.input optgroup {
   color: var(--ink-muted);
   margin-right: auto;
 }
+
+/* =============================================
+   高级设置样式
+   ============================================= */
+
+/* 高级按钮样式 */
+.action-tile--gray {
+  background: linear-gradient(135deg, #6b7280 0%, #9ca3af 100%);
+}
+
+.action-tile--gray:hover:not(:disabled) {
+  background: linear-gradient(135deg, #4b5563 0%, #6b7280 100%);
+}
+
+/* 高级设置弹窗 */
+.modal--advanced {
+  max-width: 380px;
+}
+
+/* 提示信息 */
+.advanced-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 10px 12px;
+  background: linear-gradient(135deg, var(--bg-glass) 0%, rgba(232, 93, 59, 0.03) 100%);
+  border-radius: 8px;
+  border: 1px solid var(--card-border);
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--ink-soft);
+  line-height: 1.5;
+}
+
+.advanced-hint__icon {
+  flex-shrink: 0;
+  font-size: 16px;
+  color: var(--accent);
+  margin-top: 1px;
+}
+
+.advanced-hint strong {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* 高级字段 */
+/* 高级字段 */
+.advanced-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+  /* border-bottom: none; */
+}
+
+
+.advanced-field--column {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.advanced-field:last-of-type {
+  border-bottom: none;
+}
+
+.advanced-field__label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.advanced-field__tip {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--ink-muted);
+}
+
+.advanced-field__warning {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--danger);
+}
+
+.advanced-field__value {
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+/* Toggle 开关 */
+.toggle {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+}
+
+.toggle--disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.toggle__input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle__slider {
+  position: absolute;
+  inset: 0;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: 24px;
+  cursor: pointer;
+  transition: all 0.25s ease;
+}
+
+.toggle--disabled .toggle__slider {
+  cursor: not-allowed;
+}
+
+.toggle__slider::before {
+  content: '';
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  left: 2px;
+  bottom: 2px;
+  background: white;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  transition: transform 0.25s ease;
+}
+
+.toggle__input:checked + .toggle__slider {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.toggle__input:checked + .toggle__slider::before {
+  transform: translateX(20px);
+}
+
+/* Provider 徽章 */
+.provider-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  line-height: 1; /* 确保垂直对齐 */
+}
+
+.provider-badge__icon {
+  font-size: 14px;
+}
+
+.provider-badge__status {
+  font-size: 12px; /* 与主文字一致 */
+  font-weight: 500;
+  text-transform: none;
+  opacity: 0.8;
+  margin-left: 4px;
+  display: flex;
+  align-items: center;
+}
+
+.provider-badge--gist {
+  background: linear-gradient(135deg, rgba(255, 122, 90, 0.15) 0%, rgba(255, 154, 122, 0.15) 100%);
+  color: #e85d3b;
+}
+
+.provider-badge--webdav {
+  background: linear-gradient(135deg, rgba(63, 177, 141, 0.15) 0%, rgba(110, 211, 176, 0.15) 100%);
+  color: #22a55b;
+}
+
+.provider-badge--disabled {
+  opacity: 0.6;
+}
+
+/* 时间选择 */
+.time-range {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.time-range__sep {
+  font-size: 12px;
+  color: var(--ink-muted);
+  font-weight: 500;
+}
+
+/* 高级设置下拉菜单 */
+.adv-dropdown {
+  position: relative;
+}
+
+.adv-dropdown__trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 90px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--input-border);
+  background: var(--input-bg);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.adv-dropdown__trigger:hover {
+  border-color: var(--accent);
+  background: rgba(232, 93, 59, 0.05);
+}
+
+.adv-dropdown__trigger.is-open {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(232, 93, 59, 0.12);
+}
+
+.adv-dropdown__caret {
+  font-size: 12px;
+  color: var(--ink-muted);
+  transition: transform 0.2s ease;
+}
+
+.adv-dropdown__trigger.is-open .adv-dropdown__caret {
+  transform: rotate(180deg);
+}
+
+.adv-dropdown__menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 100%;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  z-index: 100;
+  overflow: hidden;
+}
+
+.adv-dropdown__menu--scroll {
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.adv-dropdown__option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 10px 12px;
+  border: none;
+  background: transparent;
+  font-size: 13px;
+  color: var(--ink);
+  cursor: pointer;
+  transition: background 0.15s ease;
+  text-align: left;
+}
+
+.adv-dropdown__option:hover {
+  background: var(--accent-soft);
+}
+
+.adv-dropdown__option.is-selected {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.adv-dropdown__check {
+  font-size: 14px;
+  color: var(--accent);
+}
+
+/* 下拉菜单动画 */
+.dropdown-enter-active,
+.dropdown-leave-active {
+  transition: all 0.2s ease;
+}
+
+.dropdown-enter-from,
+.dropdown-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+/* 统计信息 - 环形进度 */
+.advanced-stats {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--card-border);
+}
+
+.advanced-stats__ring {
+  position: relative;
+  width: 56px;
+  height: 56px;
+}
+
+.advanced-stats__svg {
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+
+.advanced-stats__svg circle:first-child {
+  stroke: var(--card-border);
+}
+
+.advanced-stats__svg circle:last-child {
+  transition: stroke-dasharray 0.5s ease;
+}
+
+.advanced-stats__text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+
+.advanced-stats__value {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.advanced-stats__sep {
+  font-size: 12px;
+  color: var(--ink-muted);
+  font-weight: 300;
+}
+
+.advanced-stats__total {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-soft);
+}
+
+.advanced-stats__label {
+  font-size: 12px;
+  color: var(--ink-muted);
+  font-weight: 500;
+}
+
+/* 高级设置底部按钮 */
+.modal__footer--advanced {
+  flex-direction: column;
+  gap: 12px;
+}
+
+.modal__footer-actions {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.modal__footer-actions .btn {
+  flex: 1;
+}
+
+.btn--wide {
+  width: 100%;
+}
+
+/* accent 按钮 */
+.btn--accent {
+  background: linear-gradient(135deg, var(--accent) 0%, #ff8a6a 100%);
+  color: white;
+  box-shadow: 0 2px 8px rgba(232, 93, 59, 0.3);
+}
+
+.btn--accent:hover:not(:disabled) {
+  background: linear-gradient(135deg, #d94f2a 0%, #ff7a5a 100%);
+  box-shadow: 0 4px 16px rgba(232, 93, 59, 0.4);
+  transform: translateY(-1px);
+}
+
+.btn--accent:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
 </style>
+
