@@ -1317,7 +1317,7 @@ async function loadAdvancedBackupConfig() {
       advancedBackupProvider.value = result.config.provider || alternateProvider.value
       advancedBackupStartHour.value = result.config.startHour
       advancedBackupEndHour.value = result.config.endHour
-      advancedBackupCount.value = result.config.count
+      advancedBackupCount.value = Number(result.config.count) || 3
       advancedBackupTodayCount.value = result.config.todayCount
       advancedBackupHistory.value = result.config.history || []
       advancedBackupNextRunTime.value = result.config.nextRunTime
@@ -1449,13 +1449,52 @@ function collectFolderIds(nodes: FolderNode[]) {
   return ids
 }
 
-function normalizeSelection(nodes: FolderNode[], selected: Set<string>, parentSelected = true) {
+// 自动刷新书签树和选中状态
+watch(syncScopeExpanded, async (expanded) => {
+  if (expanded) {
+    await loadFolderTree()
+  }
+})
+
+/**
+ * 智能规范化选中状态：
+ * 1. 强制父子一致性检查
+ * 2. 只有当文件夹是“全新”（不在已知快照中）时，才继承父级的选中状态
+ * 3. 否则严格尊重 selected 集合（即保留用户的排除操作）
+ */
+function normalizeSelection(
+  nodes: FolderNode[], 
+  selected: Set<string>, 
+  snapshot: Set<string>, 
+  parentSelected = true
+) {
   for (const node of nodes) {
-    const isSelected = parentSelected && selected.has(node.id)
-    if (!isSelected)
+    const isExplicitlySelected = selected.has(node.id)
+    const isKnown = snapshot.has(node.id) // 是否是已知文件夹（旧文件夹）
+    
+    let isSelected = false
+
+    if (isExplicitlySelected) {
+      // 如果显式选中，那就选中
+      isSelected = true
+    } else if (!isKnown && parentSelected) {
+      // 关键逻辑：如果是新文件夹（未知），且父级被选中 -> 自动选中
+      // 这解决了“新建文件夹没被同步”的问题，同时不覆盖“手动排除的旧文件夹”
+      isSelected = true
+      selected.add(node.id)
+    } else {
+      // 既没显式选中，也不是新文件夹（说明是被排除的旧文件夹），或者父级没选中
+      isSelected = false
+    }
+    
+    // 如果最终判定为不选中，从集合移除
+    if (!isSelected) {
       selected.delete(node.id)
-    if (node.children.length)
-      normalizeSelection(node.children, selected, isSelected)
+    }
+
+    if (node.children?.length) {
+      normalizeSelection(node.children, selected, snapshot, isSelected)
+    }
   }
 }
 
@@ -1479,24 +1518,54 @@ async function loadFolderTree() {
   folderTreeMessage.value = ''
 
   try {
-    const result = await safeSendMessage('get-bookmark-folders', null, 'background')
-    if (!result.ok) {
+    // 并行加载书签树和配置
+    const [treeResult, storageResult] = await Promise.all([
+      safeSendMessage('get-bookmark-folders', null, 'background'),
+      browser.storage.local.get(['sync-folder-selection', 'sync-folder-snapshot'])
+    ])
+
+    if (!treeResult.ok) {
       folderTreeState.value = 'error'
-      folderTreeMessage.value = result.error || 'Failed to load bookmarks'
+      folderTreeMessage.value = treeResult.error || 'Failed to load bookmarks'
       return
     }
 
-    folderTree.value = (result.tree as FolderNode[]) || []
-    const stored = Array.isArray(syncFolderSelection.value) ? syncFolderSelection.value : []
+    folderTree.value = (treeResult.tree as FolderNode[]) || []
+    
+    // 加载已选列表
+    const storedSelection = storageResult['sync-folder-selection']
+    const stored = Array.isArray(storedSelection) 
+      ? storedSelection 
+      : (JSON.parse((storedSelection as string) || '[]') as string[]) // 兼容字符串格式
+
+    // 加载已知快照 (Snapshot)
+    const storedSnapshot = storageResult['sync-folder-snapshot']
+    const snapshot = new Set(Array.isArray(storedSnapshot) ? storedSnapshot : [])
+
     const selected = new Set<string>(stored)
-    if (selected.size === 0) {
+    
+    // 首次初始化：如果没有任何配置，默认全选
+    if (selected.size === 0 && snapshot.size === 0) {
       for (const id of collectFolderIds(folderTree.value))
         selected.add(id)
+    } else if (snapshot.size === 0) {
+      // 兼容老用户：如果有选区但没快照，将当前树的所有ID视为快照（避免旧的排除项被误判为“新文件夹”而自动勾选）
+      // 这样第一次加载不会有“新文件夹自动勾选”的效果，但保证了安全。
+      // 用户保存一次后，快照建立，之后的新文件夹就会生效。
+      for (const id of collectFolderIds(folderTree.value))
+        snapshot.add(id)
     }
-    normalizeSelection(folderTree.value, selected, true)
+
+    // 执行智能规范化
+    // 根节点调用：parentSelected=true，允许根目录下的新文件夹自动被选中
+    normalizeSelection(folderTree.value, selected, snapshot, true)
+    
+    // 保存计算后的选中状态
     selectedFolderIds.value = selected
-    savedFolderIds.value = new Set(selected) // 初始化已保存的选择
+    savedFolderIds.value = new Set(selected) 
     folderTreeState.value = 'idle'
+    
+    // 此时不进行自动保存，等待用户确认或触发保存操作时再更新快照
   }
   catch (error) {
     folderTreeState.value = 'error'
@@ -1506,9 +1575,18 @@ async function loadFolderTree() {
 
 async function saveFolderSelection() {
   const selection = Array.from(selectedFolderIds.value)
+  // 同时生成当前所有ID的快照
+  const currentSnapshot = collectFolderIds(folderTree.value)
+  
   syncFolderSelection.value = selection
   savedFolderIds.value = new Set(selection)
-  await browser.storage.local.set({ 'sync-folder-selection': JSON.stringify(selection) })
+  
+  // 保存 selection 和 snapshot
+  await browser.storage.local.set({ 
+    'sync-folder-selection': JSON.stringify(selection),
+    'sync-folder-snapshot': currentSnapshot // 保存为数组
+  })
+  
   void triggerUploadAfterSave()
 }
 
@@ -4862,6 +4940,41 @@ select.input optgroup {
   border-color: rgba(0, 0, 0, 0.9) transparent transparent transparent;
   pointer-events: none;
   z-index: 9999;
+}
+
+@media (prefers-color-scheme: dark) {
+  /* 修复样式覆盖问题：确保搜索框暗黑模式样式最后加载 */
+  .hidden-pages-search {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .hidden-pages-search__input {
+    background: transparent;
+    color: #e0e0e0;
+  }
+
+  .hidden-pages-search__input::placeholder {
+    color: #888;
+  }
+
+  .hidden-pages-search__icon,
+  .hidden-pages-search__clear {
+    color: #888;
+  }
+
+  /* 确保底部的圆点在暗黑模式下可见 */
+  .advanced-backup-step {
+    color: rgba(255, 255, 255, 0.2);
+  }
+  
+  .advanced-backup-step.is-done {
+    color: var(--accent);
+  }
+  
+  .advanced-backup-step.is-next {
+    color: rgba(255, 255, 255, 0.6);
+  }
 }
 </style>
 

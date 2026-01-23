@@ -422,11 +422,11 @@ async function loadLocalNodes(selectedFolderIds?: string[]) {
   // eslint-disable-next-line no-console
   console.log('[GistSync] Filtered localNodes:', JSON.stringify(localNodes, null, 2))
 
-  // 如果过滤后为空（可能是选择状态异常），返回所有书签
+  // 严格遵守过滤结果：如果过滤后为空（例如选中的文件夹被删除了），就应该返回空，而不是回退到全量。
+  // 这防止了用户原本想只同步部分内容，却因为配置目标丢失而意外泄露全部书签。
   if (localNodes.length === 0) {
     // eslint-disable-next-line no-console
-    console.log('[GistSync] Filtered result is empty, returning all bookmarks')
-    return { ok: true as const, root, localNodes: toSyncNodes(root.children) }
+    console.log('[GistSync] Filtered result is empty.')
   }
 
   return { ok: true as const, root, localNodes }
@@ -2074,7 +2074,13 @@ async function performRandomBackup(options: { isConcurrent?: boolean } = {}) {
   }
 
   // 检查今日备份次数是否已达上限（并发同步模式不占用次数）
-  const todayCount = Number(stored['advanced-backup-today-count']) || 0
+  // 动态计算今日已备份次数，避免计数器偏差
+  const history = (stored['advanced-backup-history'] as string[] | undefined) || []
+  const todayStr = new Date().toDateString()
+  // 只统计自动触发的随机备份（根据我们的逻辑，history里只存随机备份，不存随行备份，所以直接长度即可？
+  // 不，history里存的是时间戳。我们需要过滤出今天是日期的。
+  const todayCount = history.filter(ts => new Date(ts).toDateString() === todayStr).length
+
   const targetCount = (stored['advanced-backup-count'] as number | undefined) || 3
   if (!isConcurrent && todayCount >= targetCount) {
     debugLog('Random backup skipped: daily limit reached', { todayCount, targetCount })
