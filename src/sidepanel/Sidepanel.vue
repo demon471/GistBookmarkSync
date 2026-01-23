@@ -77,12 +77,14 @@ const advancedSettingsVisible = ref(false)
 const advancedSettingsLoading = ref(false)
 const advancedSettingsSaving = ref(false)
 const advancedBackupEnabled = ref(false)
+const advancedConcurrentSync = ref(false)
 const advancedBackupProvider = ref<'gist' | 'webdav' | ''>('')
 const advancedBackupStartHour = ref(9)
 const advancedBackupEndHour = ref(18)
 const advancedBackupCount = ref(3)
 const advancedBackupTodayCount = ref(0)
-const advancedBackupState = ref<'idle' | 'syncing' | 'done' | 'error'>('idle')
+const advancedBackupHistory = ref<string[]>([])
+const advancedBackupNextRunTime = ref<number | undefined>(undefined)
 
 // 高级设置下拉菜单
 const startHourDropdownOpen = ref(false)
@@ -946,6 +948,7 @@ function exportConfig() {
     syncIntervalMinutes: syncIntervalMinutes.value,
     syncFolderSelection: Array.from(selectedFolderIds.value),
     advancedBackupEnabled: advancedBackupEnabled.value,
+    advancedConcurrentSync: advancedConcurrentSync.value,
     advancedBackupProvider: advancedBackupProvider.value,
     advancedBackupStartHour: advancedBackupStartHour.value,
     advancedBackupEndHour: advancedBackupEndHour.value,
@@ -1009,6 +1012,8 @@ function importConfig() {
         advancedBackupEndHour.value = config.advancedBackupEndHour
       if (typeof config.advancedBackupCount === 'number')
         advancedBackupCount.value = config.advancedBackupCount
+      if (typeof config.advancedConcurrentSync === 'boolean')
+        advancedConcurrentSync.value = config.advancedConcurrentSync
       const storagePayload: Record<string, unknown> = {}
       if (config.syncProvider === 'webdav' || config.syncProvider === 'gist')
         storagePayload['sync-provider'] = config.syncProvider
@@ -1039,6 +1044,8 @@ function importConfig() {
         storagePayload['advanced-backup-end-hour'] = config.advancedBackupEndHour
       if (typeof config.advancedBackupCount === 'number')
         storagePayload['advanced-backup-count'] = config.advancedBackupCount
+      if (typeof config.advancedConcurrentSync === 'boolean')
+        storagePayload['advanced-concurrent-sync'] = config.advancedConcurrentSync
 
       // 导入隐藏的域名列表 - 合并模式，不会覆盖现有的
       // browser.storage.local.set() 只会更新/添加 keys，不会删除其他 keys
@@ -1305,12 +1312,15 @@ async function loadAdvancedBackupConfig() {
     const result = await safeSendMessage('get-advanced-backup-config', null, 'background')
     if (result.ok && result.config) {
       advancedBackupEnabled.value = result.config.enabled
+      advancedConcurrentSync.value = result.config.concurrentSync ?? false
       // 如果没有配置 provider，默认使用备用 provider
       advancedBackupProvider.value = result.config.provider || alternateProvider.value
       advancedBackupStartHour.value = result.config.startHour
       advancedBackupEndHour.value = result.config.endHour
       advancedBackupCount.value = result.config.count
       advancedBackupTodayCount.value = result.config.todayCount
+      advancedBackupHistory.value = result.config.history || []
+      advancedBackupNextRunTime.value = result.config.nextRunTime
     }
   }
   catch (error) {
@@ -1329,6 +1339,7 @@ async function saveAdvancedBackupConfig() {
   try {
     const result = await safeSendMessage('update-advanced-backup-config', {
       enabled: advancedBackupEnabled.value,
+      concurrentSync: advancedConcurrentSync.value,
       provider: advancedBackupProvider.value,
       startHour: advancedBackupStartHour.value,
       endHour: advancedBackupEndHour.value,
@@ -1349,37 +1360,24 @@ async function saveAdvancedBackupConfig() {
   }
 }
 
-/**
- * 立即执行随机备份
- */
-async function performRandomBackupNow() {
-  if (!advancedBackupProvider.value) {
-    showToast('请先选择备份方式', 'error')
-    return
-  }
-
-  // 先保存配置
-  await saveAdvancedBackupConfig()
-
-  advancedBackupState.value = 'syncing'
-  try {
-    const result = await safeSendMessage('random-backup-now', null, 'background')
-    if (result.ok) {
-      advancedBackupState.value = 'done'
-      showToast(result.summary || '备份成功', 'success')
-      // 刷新今日备份次数
-      await loadAdvancedBackupConfig()
-    }
-    else {
-      advancedBackupState.value = 'error'
-      showToast(result.error || '备份失败', 'error')
-    }
-  }
-  catch (error) {
-    advancedBackupState.value = 'error'
-    showToast(error instanceof Error ? error.message : '备份失败', 'error')
-  }
+function formatTime(val: string | number) {
+  const date = new Date(val)
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
+
+function getBackupStepTooltip(index: number) {
+  const i = index - 1
+  if (i < advancedBackupHistory.value.length) {
+    return formatTime(advancedBackupHistory.value[i])
+  }
+  if (i === advancedBackupHistory.value.length) {
+    return advancedBackupNextRunTime.value ? `预计 ${formatTime(advancedBackupNextRunTime.value)}` : '等待调度'
+  }
+  return '等待调度'
+}
+
+
+
 
 /**
  * 格式化小时显示
@@ -2157,7 +2155,7 @@ watch(protocolDropdownOpen, (open) => {
                   </div>
                 </div>
                 <div class="sync-log-meta">
-                  <span class="sync-log-badge" :data-mode="item.mode">{{ item.mode === 'upload' ? '推送' : item.mode === 'download' ? '拉取' : '随机' }}</span>
+                  <span class="sync-log-badge" :data-mode="item.mode">{{ item.mode === 'upload' ? '推送' : item.mode === 'download' ? '拉取' : item.mode === 'concurrent-sync' ? '随行' : '随机' }}</span>
                   <span class="sync-log-time">
                     {{ formatSyncLogTime(item.time) }}
                   </span>
@@ -2285,6 +2283,24 @@ watch(protocolDropdownOpen, (open) => {
                 </span>
               </div>
 
+              <!-- 随行同步 -->
+              <div class="advanced-field">
+                <label class="advanced-field__label">
+                  随行同步
+                  <span class="help-icon" data-tooltip="开启则每次同步都异位备份">?</span>
+                  <span v-if="!isAlternateProviderConfigured" class="advanced-field__tip">(需先配置)</span>
+                </label>
+                <label class="toggle" :class="{ 'toggle--disabled': !isAlternateProviderConfigured }">
+                  <input
+                    v-model="advancedConcurrentSync"
+                    type="checkbox"
+                    class="toggle__input"
+                    :disabled="!isAlternateProviderConfigured"
+                  >
+                  <span class="toggle__slider" />
+                </label>
+              </div>
+
               <!-- 启用开关 -->
               <div class="advanced-field">
                 <label class="advanced-field__label">
@@ -2405,51 +2421,42 @@ watch(protocolDropdownOpen, (open) => {
                 </div>
               </div>
 
-              <!-- 今日备份统计 -->
-              <div class="advanced-stats">
-                <div class="advanced-stats__ring">
-                  <svg viewBox="0 0 36 36" class="advanced-stats__svg">
-                    <circle cx="18" cy="18" r="15.5" fill="none" stroke="var(--card-border)" stroke-width="3" />
-                    <circle
-                      cx="18" cy="18" r="15.5" fill="none"
-                      stroke="var(--accent)"
-                      stroke-width="3"
-                      stroke-linecap="round"
-                      :stroke-dasharray="`${(advancedBackupTodayCount / advancedBackupCount) * 97.5} 97.5`"
-                      transform="rotate(-90 18 18)"
-                    />
-                  </svg>
-                  <div class="advanced-stats__text">
-                    <span class="advanced-stats__value">{{ advancedBackupTodayCount }}</span>
-                    <span class="advanced-stats__sep">/</span>
-                    <span class="advanced-stats__total">{{ advancedBackupCount }}</span>
-                  </div>
+              <!-- 今日备份统计 (图标形式) -->
+              <div class="advanced-stats-row">
+                <div 
+                  v-for="index in advancedBackupCount" 
+                  :key="index"
+                  class="advanced-backup-step"
+                  :class="{ 
+                    'is-done': index <= advancedBackupTodayCount,
+                    'is-next': index === advancedBackupTodayCount + 1
+                  }"
+                  :data-tooltip="getBackupStepTooltip(index)"
+                >
+                  <ph-check-circle v-if="index <= advancedBackupTodayCount" weight="fill" />
+                  <ph-clock v-else-if="index === advancedBackupTodayCount + 1" weight="regular" />
+                  <ph-circle v-else weight="regular" />
                 </div>
-                <span class="advanced-stats__label">今日已备份</span>
               </div>
 
             </template>
           </div>
           <div class="modal__footer modal__footer--advanced">
             <button
-              class="btn btn--accent btn--wide"
-              :disabled="!isAlternateProviderConfigured || advancedBackupState === 'syncing'"
-              @click="performRandomBackupNow"
+              class="btn btn--primary btn--compact"
+              :disabled="advancedSettingsLoading || advancedSettingsSaving || !isAlternateProviderConfigured"
+              @click="saveAdvancedBackupConfig"
             >
-              <ph-cloud-arrow-up v-if="advancedBackupState !== 'syncing'" class="btn__icon" />
-              <ph-circle-notch v-else class="btn__icon btn__icon--spin" />
-              {{ advancedBackupState === 'syncing' ? '备份中…' : '立即备份' }}
+              <ph-circle-notch v-if="advancedSettingsSaving" class="btn__icon btn__icon--spin" />
+              <ph-floppy-disk v-else class="btn__icon" />
+              {{ advancedSettingsSaving ? '保存中' : '保存' }}
             </button>
-            <div class="modal__footer-actions">
-              <button class="btn btn--primary" :disabled="advancedSettingsLoading || advancedSettingsSaving" @click="saveAdvancedBackupConfig">
-                <ph-circle-notch v-if="advancedSettingsSaving" class="btn__icon btn__icon--spin" />
-                <ph-floppy-disk v-else class="btn__icon" />
-                {{ advancedSettingsSaving ? '保存中' : '保存' }}
-              </button>
-              <button class="btn btn--ghost" @click="advancedSettingsVisible = false; closeAllAdvancedDropdowns()">
-                关闭
-              </button>
-            </div>
+            <button
+              class="btn btn--ghost btn--compact"
+              @click="advancedSettingsVisible = false; closeAllAdvancedDropdowns()"
+            >
+              关闭
+            </button>
           </div>
         </div>
       </div>
@@ -2481,6 +2488,8 @@ watch(protocolDropdownOpen, (open) => {
   --success-soft: rgba(34, 165, 91, 0.12);
   --danger: #dc3545;
   --danger-soft: rgba(220, 53, 69, 0.12);
+  --btn-disabled-bg: #d1d5db;
+  --btn-disabled-text: #6b7280;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -2508,6 +2517,8 @@ watch(protocolDropdownOpen, (open) => {
     --success-soft: rgba(74, 222, 128, 0.18);
     --danger: #f87171;
     --danger-soft: rgba(248, 113, 113, 0.18);
+    --btn-disabled-bg: rgba(255, 255, 255, 0.1);
+    --btn-disabled-text: rgba(255, 255, 255, 0.4);
   }
 }
 
@@ -3108,6 +3119,12 @@ watch(protocolDropdownOpen, (open) => {
   background: rgba(139, 92, 246, 0.12);
 }
 
+.sync-log-badge[data-mode="concurrent-sync"] {
+  color: #06b6d4;
+  border-color: rgba(6, 182, 212, 0.4);
+  background: rgba(6, 182, 212, 0.12);
+}
+
 .sync-log-time {
   font-size: 11px;
   color: var(--ink-muted);
@@ -3538,6 +3555,13 @@ select.input optgroup {
   box-shadow: 0 3px 10px rgba(232, 93, 59, 0.3);
 }
 
+.btn--primary:disabled {
+  background: var(--btn-disabled-bg);
+  color: var(--btn-disabled-text);
+  box-shadow: none;
+  opacity: 1;
+}
+
 .btn--accent {
   background: var(--accent-soft);
   color: var(--accent);
@@ -3551,15 +3575,23 @@ select.input optgroup {
 
 .btn--ghost {
   padding: 5px 9px;
-  background: transparent;
-  color: var(--ink-soft);
-  border: 1px dashed var(--input-border);
+  background: rgba(255,255,255,0.8);
+  color: var(--ink);
+  border: 1px solid #cbd5e1;
 }
 
 .btn--ghost:not(:disabled):hover {
   background: var(--accent-soft);
   color: var(--accent);
   border-color: transparent;
+}
+
+@media (prefers-color-scheme: dark) {
+  .btn--ghost {
+    background: transparent;
+    border-color: rgba(255, 255, 255, 0.2);
+    color: var(--ink-muted);
+  }
 }
 
 .btn--danger {
@@ -3866,8 +3898,8 @@ select.input optgroup {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.4);
-  backdrop-filter: blur(4px);
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4327,7 +4359,7 @@ select.input optgroup {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 0;
+  padding: 3px 0;
   /* border-bottom: none; */
 }
 
@@ -4372,8 +4404,8 @@ select.input optgroup {
 .toggle {
   position: relative;
   display: inline-block;
-  width: 44px;
-  height: 24px;
+  width: 36px;
+  height: 20px;
 }
 
 .toggle--disabled {
@@ -4390,11 +4422,20 @@ select.input optgroup {
 .toggle__slider {
   position: absolute;
   inset: 0;
-  background: var(--input-bg);
-  border: 1px solid var(--input-border);
-  border-radius: 24px;
+  /* Light mode default (darker for visibility) */
+  /* Light mode default (darker for visibility) */
+  background: #cbd5e1;
+  border: 1px solid #94a3b8;
+  border-radius: 4px;
   cursor: pointer;
   transition: all 0.25s ease;
+}
+
+@media (prefers-color-scheme: dark) {
+  .toggle__slider {
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
 }
 
 .toggle--disabled .toggle__slider {
@@ -4404,14 +4445,14 @@ select.input optgroup {
 .toggle__slider::before {
   content: '';
   position: absolute;
-  width: 18px;
-  height: 18px;
+  width: 14px;
+  height: 14px;
   left: 2px;
   bottom: 2px;
   background: white;
-  border-radius: 50%;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
-  transition: transform 0.25s ease;
+  border-radius: 2px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+  transition: transform 0.25s cubic-bezier(0.4, 0.0, 0.2, 1);
 }
 
 .toggle__input:checked + .toggle__slider {
@@ -4420,7 +4461,7 @@ select.input optgroup {
 }
 
 .toggle__input:checked + .toggle__slider::before {
-  transform: translateX(20px);
+  transform: translateX(16px);
 }
 
 /* Provider 徽章 */
@@ -4487,13 +4528,16 @@ select.input optgroup {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  min-width: 90px;
-  padding: 8px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--input-border);
-  background: var(--input-bg);
-  font-size: 13px;
+  gap: 6px;
+  min-width: 80px;
+  padding: 2px 8px;
+  border-radius: 4px; /* Square style */
+  border-radius: 4px; /* Square style */
+  /* Light mode: solid border/bg for visibility */
+  border: 1px solid #cbd5e1;
+  background: white;
+  font-size: 12px;
+  height: 24px; /* Match similar height to toggle */
   font-weight: 500;
   color: var(--ink);
   cursor: pointer;
@@ -4508,6 +4552,13 @@ select.input optgroup {
 .adv-dropdown__trigger.is-open {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(232, 93, 59, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  .adv-dropdown__trigger {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08); /* Revert to subtle border in dark mode */
+  }
 }
 
 .adv-dropdown__caret {
@@ -4527,7 +4578,7 @@ select.input optgroup {
   min-width: 100%;
   background: var(--card);
   border: 1px solid var(--card-border);
-  border-radius: 10px;
+  border-radius: 6px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
   z-index: 100;
   overflow: hidden;
@@ -4543,10 +4594,10 @@ select.input optgroup {
   align-items: center;
   justify-content: space-between;
   width: 100%;
-  padding: 10px 12px;
+  padding: 6px 10px;
   border: none;
   background: transparent;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--ink);
   cursor: pointer;
   transition: background 0.15s ease;
@@ -4584,16 +4635,16 @@ select.input optgroup {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
-  margin-top: 10px;
-  padding-top: 10px;
+  gap: 2px;
+  margin-top: 8px;
+  padding-top: 8px;
   border-top: 1px solid var(--card-border);
 }
 
 .advanced-stats__ring {
   position: relative;
-  width: 56px;
-  height: 56px;
+  width: 52px;
+  height: 52px;
 }
 
 .advanced-stats__svg {
@@ -4620,15 +4671,17 @@ select.input optgroup {
 }
 
 .advanced-stats__value {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 700;
   color: var(--accent);
+  line-height: 1;
 }
 
 .advanced-stats__sep {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--ink-muted);
   font-weight: 300;
+  line-height: 1;
 }
 
 .advanced-stats__total {
@@ -4638,15 +4691,26 @@ select.input optgroup {
 }
 
 .advanced-stats__label {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--ink-muted);
   font-weight: 500;
+  opacity: 0.8;
 }
 
 /* 高级设置底部按钮 */
 .modal__footer--advanced {
-  flex-direction: column;
+  display: flex;
+  flex-direction: row;
   gap: 12px;
+  padding-top: 12px;
+}
+.btn--compact {
+  flex: 1;
+  height: 28px;
+  border-radius: 4px; /* Default square theme radius */
+  font-size: 12px;
+  padding: 0 12px;
+  font-weight: 500;
 }
 
 .modal__footer-actions {
@@ -4681,6 +4745,123 @@ select.input optgroup {
   cursor: not-allowed;
   transform: none;
   box-shadow: none;
+}
+
+/* 帮助图标 */
+.help-icon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: rgba(125, 125, 125, 0.2);
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  margin-left: 6px;
+  cursor: help;
+  transition: all 0.2s ease;
+  border: 1px solid rgba(125, 125, 125, 0.3);
+}
+
+.help-icon:hover {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+
+/* Custom Tooltip */
+.help-icon[data-tooltip]:hover::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%) translateY(-8px);
+  background: rgba(0, 0, 0, 0.9);
+  color: white;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 9999;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(4px);
+}
+
+.help-icon[data-tooltip]:hover::before {
+  content: '';
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%) translateY(-3px);
+  border-width: 5px;
+  border-style: solid;
+  border-color: rgba(0, 0, 0, 0.9) transparent transparent transparent;
+  pointer-events: none;
+  z-index: 9999;
+}
+
+.advanced-stats-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin: 16px 0 8px 0;
+}
+
+.advanced-backup-step {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  color: var(--input-border);
+  cursor: help;
+  transition: all 0.2s ease;
+}
+
+.advanced-backup-step.is-done {
+  color: var(--accent);
+}
+
+.advanced-backup-step.is-next {
+  color: var(--ink-muted);
+}
+
+/* Tooltip for steps */
+.advanced-backup-step[data-tooltip]:hover::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%) translateY(-8px);
+  background: rgba(0, 0, 0, 0.9);
+  color: white;
+  padding: 5px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 9999;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+}
+
+.advanced-backup-step[data-tooltip]:hover::before {
+  content: '';
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%) translateY(-3px);
+  border-width: 5px;
+  border-style: solid;
+  border-color: rgba(0, 0, 0, 0.9) transparent transparent transparent;
+  pointer-events: none;
+  z-index: 9999;
 }
 </style>
 

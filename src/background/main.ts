@@ -154,7 +154,7 @@ interface SyncLogEntry {
   id: string
   time: string
   provider: 'gist' | 'webdav'
-  mode: 'upload' | 'download' | 'random-backup'
+  mode: 'upload' | 'download' | 'random-backup' | 'concurrent-sync'
   status: 'ok' | 'error'
   summary: string
 }
@@ -206,12 +206,29 @@ async function normalizeSyncLogs() {
   debugLog('Sync log trimmed', next.length)
 }
 
+// Simple mutex to prevent race conditions during log append
+let logMutex = Promise.resolve()
+
 async function appendSyncLog(entry: SyncLogEntry) {
-  const stored = await browser.storage.local.get([SYNC_LOG_KEY])
-  const existing = parseSyncLogValue(stored[SYNC_LOG_KEY])
-  const next = [entry, ...existing].slice(0, MAX_SYNC_LOGS)
-  await browser.storage.local.set({ [SYNC_LOG_KEY]: JSON.stringify(next) })
-  debugLog('Sync log appended', entry)
+  const currentTask = logMutex.then(async () => {
+    const stored = await browser.storage.local.get([SYNC_LOG_KEY])
+    const existing = parseSyncLogValue(stored[SYNC_LOG_KEY])
+    // Deduplicate logic: prevent exact duplicate logs in short timeframe
+    if (existing.length > 0) {
+      const last = existing[0]
+      if (last.time === entry.time && last.summary === entry.summary && last.provider === entry.provider) {
+        return
+      }
+    }
+    const next = [entry, ...existing].slice(0, MAX_SYNC_LOGS)
+    await browser.storage.local.set({ [SYNC_LOG_KEY]: JSON.stringify(next) })
+    debugLog('Sync log appended', entry)
+  }).catch(err => {
+    console.error('Failed to append log', err)
+  })
+
+  logMutex = currentTask
+  await currentTask
 }
 
 async function finalizeSyncResult(
@@ -1224,7 +1241,7 @@ browser.storage.onChanged.addListener((changes, areaName) => {
     || changes['advanced-backup-count']
   ) {
     debugLog('Advanced backup config changed, rescheduling...')
-    void scheduleNextRandomBackup()
+    void scheduleNextRandomBackup(true)
   }
 })
 
@@ -1715,6 +1732,7 @@ async function performSync(mode: 'upload' | 'download') {
       'webdav-url',
       'webdav-username',
       'webdav-password',
+      'advanced-concurrent-sync',
     ])
     provider = (stored['sync-provider'] as string | undefined) || 'gist'
     const token = (stored['github-token'] as string | undefined)?.trim()
@@ -1722,6 +1740,7 @@ async function performSync(mode: 'upload' | 'download') {
     const fileName = (stored['gist-file-name'] as string | undefined)?.trim()
     const syncDirection = (stored['sync-direction'] as string | undefined) || 'pull'
     const conflictStrategy = (stored['sync-conflict-strategy'] as string | undefined) || 'gist-wins'
+    const concurrentSync = stored['advanced-concurrent-sync'] === true
 
     // sync-folder-selection 可能是字符串（JSON）或数组，需要正确解析
     const selectedFolderIds = parseSelectedFolderIds(stored['sync-folder-selection'])
@@ -1826,6 +1845,10 @@ async function performSync(mode: 'upload' | 'download') {
             'webdav-last-sync-summary': '无变更，已跳过上传',
             'webdav-last-sync-folders': selectedFolderIds || [],
           })
+          if (mode === 'upload' && concurrentSync) {
+            void performRandomBackup({ isConcurrent: true })
+          }
+
           return await finalizeSyncResult(provider, mode, {
             ok: true,
             summary: '无变更，已跳过上传',
@@ -1861,6 +1884,10 @@ async function performSync(mode: 'upload' | 'download') {
           'webdav-last-sync-summary': summary,
           'webdav-last-sync-folders': selectedFolderIds || [],
         })
+
+        if (mode === 'upload' && concurrentSync) {
+          void performRandomBackup({ isConcurrent: true })
+        }
 
         return await finalizeSyncResult(provider, mode, {
           ok: true,
@@ -1946,6 +1973,10 @@ async function performSync(mode: 'upload' | 'download') {
         'gist-last-sync-folders': selectedFolderIds || [],
       })
 
+      if (mode === 'upload' && concurrentSync) {
+        void performRandomBackup({ isConcurrent: true })
+      }
+
       return await finalizeSyncResult(provider, mode, {
         ok: true,
         summary,
@@ -2010,12 +2041,13 @@ onMessage('sync-now', async () => {
  * 执行随机备份：使用备用 provider 上传书签
  * 与主同步不同，随机备份使用配置的备用 provider
  */
-async function performRandomBackup() {
-  debugLog('performRandomBackup start')
+async function performRandomBackup(options: { isConcurrent?: boolean } = {}) {
+  const isConcurrent = options.isConcurrent === true
+  debugLog('performRandomBackup start', { isConcurrent })
 
   const stored = await browser.storage.local.get([
     'advanced-backup-enabled',
-    'advanced-backup-provider',
+    'sync-provider',
     'sync-folder-selection',
     'github-token',
     'gist-id',
@@ -2025,20 +2057,26 @@ async function performRandomBackup() {
     'webdav-password',
     'advanced-backup-today-count',
     'advanced-backup-count',
+    'advanced-backup-history',
   ])
 
   const enabled = stored['advanced-backup-enabled'] === true
-  const backupProvider = (stored['advanced-backup-provider'] as string | undefined) || ''
 
-  if (!enabled || !backupProvider) {
-    debugLog('Random backup skipped: not enabled or no backup provider')
-    return { ok: false, error: '随机备份未启用或未配置备份方式' }
+  // 动态确定备份 provider：总是与主同步方式相反（互补）
+  const mainProvider = (stored['sync-provider'] as string | undefined) || 'gist'
+  const backupProvider = mainProvider === 'gist' ? 'webdav' : 'gist'
+
+  // 如果是随机备份模式，需要检查是否启用；如果是并发同步模式，忽略随机备份的开关
+  // 这里不再检查 !backupProvider，因为我们动态计算保证有值
+  if (!isConcurrent && !enabled) {
+    debugLog('Random backup skipped: not enabled')
+    return { ok: false, error: '随机备份未启用' }
   }
 
-  // 检查今日备份次数是否已达上限
+  // 检查今日备份次数是否已达上限（并发同步模式不占用次数）
   const todayCount = Number(stored['advanced-backup-today-count']) || 0
   const targetCount = (stored['advanced-backup-count'] as number | undefined) || 3
-  if (todayCount >= targetCount) {
+  if (!isConcurrent && todayCount >= targetCount) {
     debugLog('Random backup skipped: daily limit reached', { todayCount, targetCount })
     return { ok: false, error: '今日备份次数已达上限' }
   }
@@ -2070,12 +2108,12 @@ async function performRandomBackup() {
 
       const ensureResult = await ensureWebDavDirectories(baseUrl, filePath, username, password)
       if (!ensureResult.ok) {
-        return await finalizeRandomBackupResult(provider, { ok: false, error: ensureResult.error })
+        return await finalizeRandomBackupResult(provider, { ok: false, error: ensureResult.error }, isConcurrent)
       }
 
       const updated = await updateWebDavFile(fileUrl, username, password, localNodes)
       if (!updated.ok) {
-        return await finalizeRandomBackupResult(provider, { ok: false, error: updated.error })
+        return await finalizeRandomBackupResult(provider, { ok: false, error: updated.error }, isConcurrent)
       }
 
       const fullPayload = buildBookmarkPayload(localNodes)
@@ -2084,15 +2122,23 @@ async function performRandomBackup() {
       await saveWebDavVersionSnapshot(baseUrl, username, password, payloadText, localCount)
 
 
-      const summary = `随机备份成功 ${localCount} 条书签 (WebDAV)`
+      const actionName = isConcurrent ? '随行备份' : '随机备份'
+      const summary = `${actionName}成功 ${localCount} 条书签 (WebDAV)`
       const timestamp = new Date().toISOString()
 
-      // 更新今日备份计数
-      await browser.storage.local.set({
-        'advanced-backup-today-count': todayCount + 1,
-      })
+      // 只有非随行备份（即随机备份）才记录历史和消耗次数
+      if (!isConcurrent) {
+        // 更新今日备份计数和历史记录
+        const history = (stored['advanced-backup-history'] as string[] | undefined) || []
+        history.push(timestamp)
 
-      return await finalizeRandomBackupResult(provider, { ok: true, summary, timestamp })
+        await browser.storage.local.set({
+          'advanced-backup-today-count': todayCount + 1,
+          'advanced-backup-history': history,
+        })
+      }
+
+      return await finalizeRandomBackupResult(provider, { ok: true, summary, timestamp }, isConcurrent)
     }
     else {
       // 使用 Gist 备份
@@ -2101,29 +2147,38 @@ async function performRandomBackup() {
       const fileName = (stored['gist-file-name'] as string | undefined)?.trim()
 
       if (!token || !gistId || !fileName) {
-        return await finalizeRandomBackupResult(provider, { ok: false, error: 'Gist 未配置' })
+        return await finalizeRandomBackupResult(provider, { ok: false, error: 'Gist 未配置' }, isConcurrent)
       }
 
       const updated = await updateGistFile(token, gistId, fileName, localNodes)
       if (!updated) {
-        return await finalizeRandomBackupResult(provider, { ok: false, error: 'Gist 更新失败' })
+        return await finalizeRandomBackupResult(provider, { ok: false, error: 'Gist 更新失败' }, isConcurrent)
       }
 
       const localCount = countBookmarks(localNodes)
-      const summary = `随机备份成功 ${localCount} 条书签 (Gist)`
+      const actionName = isConcurrent ? '随行备份' : '随机备份'
+      const summary = `${actionName}成功 ${localCount} 条书签 (Gist)`
       const timestamp = new Date().toISOString()
 
-      // 更新今日备份计数
-      await browser.storage.local.set({
-        'advanced-backup-today-count': todayCount + 1,
-      })
+      // 只有非随行备份（即随机备份）才记录历史和消耗次数
+      if (!isConcurrent) {
+        // 更新今日备份计数和历史记录
+        const history = (stored['advanced-backup-history'] as string[] | undefined) || []
+        history.push(timestamp)
 
-      return await finalizeRandomBackupResult(provider, { ok: true, summary, timestamp })
+        await browser.storage.local.set({
+          'advanced-backup-today-count': todayCount + 1,
+          'advanced-backup-history': history,
+        })
+      }
+
+      return await finalizeRandomBackupResult(provider, { ok: true, summary, timestamp }, isConcurrent)
     }
   }
   catch (error) {
-    const message = error instanceof Error ? error.message : '随机备份失败'
-    return await finalizeRandomBackupResult(provider, { ok: false, error: message })
+    const actionName = isConcurrent ? '随行备份' : '随机备份'
+    const message = error instanceof Error ? error.message : `${actionName}失败`
+    return await finalizeRandomBackupResult(provider, { ok: false, error: message }, isConcurrent)
   }
 }
 
@@ -2133,14 +2188,15 @@ async function performRandomBackup() {
 async function finalizeRandomBackupResult(
   provider: 'gist' | 'webdav',
   result: { ok: true, summary?: string, timestamp?: string } | { ok: false, error?: string },
+  isConcurrent = false,
 ) {
   const entry: SyncLogEntry = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     time: 'timestamp' in result && result.timestamp ? result.timestamp : new Date().toISOString(),
     provider,
-    mode: 'random-backup',
+    mode: isConcurrent ? 'concurrent-sync' : 'random-backup',
     status: result.ok ? 'ok' : 'error',
-    summary: result.ok ? (result.summary || '随机备份成功') : (result.error || '随机备份失败'),
+    summary: result.ok ? (result.summary || '备份成功') : (result.error || '备份失败'),
   }
   await appendSyncLog(entry)
   debugLog('Random backup finalized', entry)
@@ -2197,7 +2253,11 @@ function calculateNextRandomBackupDelay(endHour: number, remainingCount: number)
 /**
  * 设置下一次随机备份的 alarm
  */
-async function scheduleNextRandomBackup() {
+/**
+ * 设置下一次随机备份的 alarm
+ * @param force 是否强制重新调度（忽略已有 alarm）
+ */
+async function scheduleNextRandomBackup(force = false) {
   const stored = await browser.storage.local.get([
     'advanced-backup-enabled',
     'advanced-backup-provider',
@@ -2206,13 +2266,21 @@ async function scheduleNextRandomBackup() {
     'advanced-backup-count',
     'advanced-backup-today-count',
     'advanced-backup-last-date',
+    'advanced-backup-history',
+    'advanced-backup-next-run-time',
   ])
 
   const enabled = stored['advanced-backup-enabled'] === true
   const backupProvider = stored['advanced-backup-provider'] as string | undefined
 
-  if (!enabled || !backupProvider) {
-    debugLog('Random backup scheduling skipped: not enabled')
+  if (!enabled) {
+    debugLog('Random backup scheduling skipped: feature not enabled')
+    await browser.alarms?.clear(RANDOM_BACKUP_ALARM_NAME)
+    return
+  }
+
+  if (!backupProvider) {
+    debugLog('Random backup scheduling skipped: no backup provider selected')
     await browser.alarms?.clear(RANDOM_BACKUP_ALARM_NAME)
     return
   }
@@ -2229,6 +2297,8 @@ async function scheduleNextRandomBackup() {
     await browser.storage.local.set({
       'advanced-backup-last-date': today,
       'advanced-backup-today-count': 0,
+      'advanced-backup-history': [],
+      'advanced-backup-next-run-time': null,
     })
     debugLog('Random backup: new day, reset today count')
   }
@@ -2240,6 +2310,18 @@ async function scheduleNextRandomBackup() {
     debugLog('Random backup scheduling skipped: daily limit reached')
     await browser.alarms?.clear(RANDOM_BACKUP_ALARM_NAME)
     return
+  }
+
+  // 如果非强制且已有 alarm，跳过
+  if (!force) {
+    const existing = await browser.alarms?.get(RANDOM_BACKUP_ALARM_NAME)
+    if (existing) {
+      debugLog('Random backup alarm already scheduled, skipping', {
+        scheduledTime: new Date(existing.scheduledTime).toLocaleString(),
+        force
+      })
+      return
+    }
   }
 
   // 如果不在时间区间内，计算到开始时间的延迟
@@ -2256,7 +2338,15 @@ async function scheduleNextRandomBackup() {
     }
 
     const delayMs = hoursUntilStart * 60 * 60 * 1000 + Math.random() * 30 * 60 * 1000
-    debugLog('Random backup: not in time range, scheduling for start', { hoursUntilStart })
+    const scheduledTime = new Date(Date.now() + delayMs).toLocaleString()
+    debugLog('Random backup: not in time range, scheduling for start', {
+      hoursUntilStart,
+      scheduledTime
+    })
+    const nextRunTime = Date.now() + delayMs
+    await browser.storage.local.set({
+      'advanced-backup-next-run-time': nextRunTime
+    })
     await browser.alarms?.create(RANDOM_BACKUP_ALARM_NAME, { delayInMinutes: delayMs / 60000 })
     return
   }
@@ -2264,7 +2354,17 @@ async function scheduleNextRandomBackup() {
   // 在时间区间内，计算下次备份时间
   // 修正：基于剩余时间计算，而非全天时间
   const delayMs = calculateNextRandomBackupDelay(endHour, dailyCount - actualTodayCount)
-  debugLog('Random backup: scheduling next backup', { delayMinutes: delayMs / 60000 })
+  const scheduledTime = new Date(Date.now() + delayMs).toLocaleString()
+  debugLog(`Random backup: scheduling next backup (${actualTodayCount + 1}/${dailyCount})`, {
+    delayMinutes: (delayMs / 60000).toFixed(1),
+    scheduledTime
+  })
+
+  const nextRunTime = Date.now() + delayMs
+  await browser.storage.local.set({
+    'advanced-backup-next-run-time': nextRunTime
+  })
+
   await browser.alarms?.create(RANDOM_BACKUP_ALARM_NAME, { delayInMinutes: delayMs / 60000 })
 }
 
@@ -2288,7 +2388,7 @@ browser.alarms?.onAlarm.addListener(async (alarm) => {
     }
 
     // 调度下一次备份
-    await scheduleNextRandomBackup()
+    await scheduleNextRandomBackup(true)
   }
 })
 
@@ -2319,11 +2419,18 @@ onMessage('get-advanced-backup-config', async () => {
     'advanced-backup-count',
     'advanced-backup-today-count',
     'advanced-backup-last-date',
+    'advanced-backup-history',
+    'advanced-backup-next-run-time',
+    'advanced-backup-history',
+    'advanced-backup-next-run-time',
+    'advanced-concurrent-sync',
   ])
 
   const today = new Date().toISOString().slice(0, 10)
   const lastDate = (stored['advanced-backup-last-date'] as string | undefined) || ''
   const todayCount = lastDate === today ? (Number(stored['advanced-backup-today-count']) || 0) : 0
+  const history = lastDate === today ? (stored['advanced-backup-history'] as string[] || []) : []
+  const nextRunTime = stored['advanced-backup-next-run-time'] as number | undefined
 
   return {
     ok: true,
@@ -2334,6 +2441,9 @@ onMessage('get-advanced-backup-config', async () => {
       endHour: (stored['advanced-backup-end-hour'] as number | undefined) ?? 18,
       count: (stored['advanced-backup-count'] as number | undefined) || 3,
       todayCount,
+      history,
+      nextRunTime,
+      concurrentSync: stored['advanced-concurrent-sync'] === true,
     },
   }
 })
@@ -2346,6 +2456,7 @@ onMessage('update-advanced-backup-config', async ({ data }) => {
     startHour?: number
     endHour?: number
     count?: number
+    concurrentSync?: boolean
   } | undefined
 
   if (!config) {
@@ -2369,12 +2480,15 @@ onMessage('update-advanced-backup-config', async ({ data }) => {
   if (typeof config.count === 'number') {
     updates['advanced-backup-count'] = Math.max(1, Math.min(10, config.count))
   }
+  if (typeof config.concurrentSync === 'boolean') {
+    updates['advanced-concurrent-sync'] = config.concurrentSync
+  }
 
   await browser.storage.local.set(updates)
   debugLog('Advanced backup config updated', updates)
 
-  // 重新调度随机备份
-  await scheduleNextRandomBackup()
+  // 不再手动调用，依赖 browser.storage.onChanged 监听器触发重新调度
+  // await scheduleNextRandomBackup(true)
 
   return { ok: true }
 })

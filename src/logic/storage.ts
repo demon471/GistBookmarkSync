@@ -43,7 +43,7 @@ export interface SyncLogEntry {
   id: string
   time: string
   provider: 'gist' | 'webdav'
-  mode: 'upload' | 'download' | 'random-backup'
+  mode: 'upload' | 'download' | 'random-backup' | 'concurrent-sync'
   status: 'ok' | 'error'
   summary: string
 }
