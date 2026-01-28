@@ -13,15 +13,13 @@ if (import.meta.hot) {
 // remove or turn this off if you don't use side panel
 const USE_SIDE_PANEL = true
 
-// to toggle the sidepanel with the action button in chromium:
-if (USE_SIDE_PANEL) {
-  // @ts-expect-error missing types
-  browser.sidePanel
-    .setPanelBehavior({ openPanelOnActionClick: true })
-    .catch((error: unknown) => console.error(error))
-}
-
 browser.runtime.onInstalled.addListener((): void => {
+  if (USE_SIDE_PANEL) {
+    // @ts-expect-error missing types
+    browser.sidePanel
+      .setPanelBehavior({ openPanelOnActionClick: false })
+      .catch((error: unknown) => console.error(error))
+  }
   // eslint-disable-next-line no-console
   console.log('Extension installed')
 })
@@ -264,37 +262,16 @@ function toSyncNodes(nodes?: browser.bookmarks.BookmarkTreeNode[]): SyncNode[] {
   })
 }
 
-function filterLocalNodes(
-  nodes: browser.bookmarks.BookmarkTreeNode[],
-  selectedIds: Set<string>,
-): SyncNode[] {
-  const result: SyncNode[] = []
+/**
+ * 在 Restore (下载/合并) 后，因为文件夹 ID 会发生变化，
+ * 我们需要刷新选中状态：
+ * 1. 保留依然存在的旧选中 ID。
+ * 2. 自动选中新出现的 ID (不在旧快照里的 ID)。
+ * 3. 更新快照为当前所有 ID。
+ */
 
-  for (const node of nodes) {
-    // 书签：检查父文件夹是否被选中（书签没有自己的 ID 在 selectedIds 中）
-    // 书签的包含由其所在文件夹决定，这里我们在文件夹层面处理
-    if (node.url) {
-      // 书签直接添加（因为我们只会在选中的文件夹内递归调用此函数）
-      result.push({ title: node.title || node.url, url: node.url })
-      continue
-    }
 
-    // 文件夹：检查是否被选中
-    if (!selectedIds.has(node.id)) {
-      // 文件夹未选中，跳过它及其所有内容
-      continue
-    }
 
-    // 文件夹被选中，递归处理子节点
-    const children = filterLocalNodes(node.children || [], selectedIds)
-    result.push({
-      title: node.title || 'Untitled',
-      children,
-    })
-  }
-
-  return result
-}
 
 function sanitizeNodes(input: unknown): SyncNode[] {
   if (!Array.isArray(input))
@@ -398,36 +375,14 @@ async function loadGistBookmarks(token: string, gistId: string, fileName: string
   return { ok: true, gistNodes, raw: parsed }
 }
 
-async function loadLocalNodes(selectedFolderIds?: string[]) {
+async function loadLocalNodes() {
   const localTree = await browser.bookmarks.getTree()
   const root = localTree[0]
   if (!root)
     return { ok: false as const, error: 'Failed to read local bookmarks' }
 
-  const selectedSet = new Set(selectedFolderIds || [])
-
-  // eslint-disable-next-line no-console
-  console.log('[GistSync] loadLocalNodes - selectedSet size:', selectedSet.size, 'ids:', Array.from(selectedSet))
-
-  // 如果没有选择任何文件夹，返回所有书签
-  if (selectedSet.size === 0) {
-    // eslint-disable-next-line no-console
-    console.log('[GistSync] No folder selection, returning all bookmarks')
-    return { ok: true as const, root, localNodes: toSyncNodes(root.children) }
-  }
-
-  // 有选择的文件夹，进行过滤
-  const localNodes = filterLocalNodes(root.children || [], selectedSet)
-
-  // eslint-disable-next-line no-console
-  console.log('[GistSync] Filtered localNodes:', JSON.stringify(localNodes, null, 2))
-
-  // 严格遵守过滤结果：如果过滤后为空（例如选中的文件夹被删除了），就应该返回空，而不是回退到全量。
-  // 这防止了用户原本想只同步部分内容，却因为配置目标丢失而意外泄露全部书签。
-  if (localNodes.length === 0) {
-    // eslint-disable-next-line no-console
-    console.log('[GistSync] Filtered result is empty.')
-  }
+  // 始终全量同步，不再过滤
+  const localNodes = toSyncNodes(root.children)
 
   return { ok: true as const, root, localNodes }
 }
@@ -678,7 +633,6 @@ async function applyWebDavDownload(
   remoteNodes: SyncNode[],
   root: browser.bookmarks.BookmarkTreeNode,
   localNodes: SyncNode[],
-  selectedFolderIds: string[] | undefined,
 ) {
   const mergedNodes = mergeNodeLists(localNodes, remoteNodes)
 
@@ -692,7 +646,6 @@ async function applyWebDavDownload(
   await browser.storage.local.set({
     'webdav-last-sync': timestamp,
     'webdav-last-sync-summary': summary,
-    'webdav-last-sync-folders': selectedFolderIds || [],
   })
 
   return {
@@ -701,6 +654,7 @@ async function applyWebDavDownload(
     timestamp,
   }
 }
+
 
 async function updateWebDavFile(url: string, username: string | undefined, password: string | undefined, nodes: SyncNode[]) {
   const payload = buildBookmarkPayload(nodes)
@@ -941,8 +895,6 @@ async function openSidePanelForActiveTab() {
     if (!tabId || !browser.sidePanel?.open)
       return
     // @ts-expect-error sidePanel is not typed in polyfill
-    void browser.sidePanel.setOptions?.({ tabId, path: 'dist/sidepanel/index.html', enabled: true })
-    // @ts-expect-error sidePanel is not typed in polyfill
     void browser.sidePanel.open({ tabId })
   }
   catch {
@@ -950,8 +902,8 @@ async function openSidePanelForActiveTab() {
   }
 }
 
-function parseSelectedFolderIds(rawSelection: unknown) {
-  let selectedFolderIds: string[] | undefined
+function parseSelectedFolderIds(rawSelection: unknown): string[] {
+  let selectedFolderIds: unknown[] | undefined
   if (typeof rawSelection === 'string') {
     try {
       selectedFolderIds = JSON.parse(rawSelection)
@@ -963,7 +915,11 @@ function parseSelectedFolderIds(rawSelection: unknown) {
   else if (Array.isArray(rawSelection)) {
     selectedFolderIds = rawSelection
   }
-  return selectedFolderIds || []
+
+  if (!Array.isArray(selectedFolderIds))
+    return []
+
+  return selectedFolderIds.map(String)
 }
 
 async function isNodeInSelectedScope(nodeId: string, selectedSet: Set<string>) {
@@ -1341,132 +1297,40 @@ async function ensureLocalEntries(rootId: string, index: Map<string, LocalFolder
   await walk(nodes, '', rootId)
 }
 
-async function clearLocalBookmarks(root: browser.bookmarks.BookmarkTreeNode, selectedSet?: Set<string>) {
-  const selected = selectedSet || new Set<string>()
-  const clearAll = selected.size === 0
+async function clearLocalBookmarks(root: browser.bookmarks.BookmarkTreeNode, protectedIds?: Set<string>) {
   // eslint-disable-next-line no-console
-  console.log('[ClearBookmarks] start', { selectedCount: selected.size })
+  console.log('[ClearBookmarks] Clearing bookmarks', { protectedCount: protectedIds?.size })
 
-  function countBookmarksInSubtree(node: browser.bookmarks.BookmarkTreeNode): number {
-    if (node.url)
-      return 1
-    let count = 0
-    for (const child of node.children || [])
-      count += countBookmarksInSubtree(child)
-    return count
-  }
-
-  async function clearFolderContents(node: browser.bookmarks.BookmarkTreeNode, isSelected: boolean) {
-    if (!node.children)
-      return
-
+  async function removeAllChildren(node: browser.bookmarks.BookmarkTreeNode) {
+    if (!node.children) return
     for (const child of node.children) {
+      // 如果节点被保护（排除在同步之外），则跳过（不删除也不递归删除其子节点）
+      if (protectedIds && protectedIds.has(child.id))
+        continue
+
       if (child.url) {
-        if (isSelected || clearAll) {
-          try {
-            await browser.bookmarks.remove(child.id)
-          }
-          catch {
-            // eslint-disable-next-line no-console
-            console.warn('[ClearBookmarks] failed to remove bookmark', { id: child.id, title: child.title, url: child.url })
-          }
-        }
-        continue
+        await browser.bookmarks.remove(child.id).catch(() => { })
       }
-
-      if (clearAll) {
-        await clearFolderContents(child, true)
-        try {
-          await browser.bookmarks.remove(child.id)
-        }
-        catch {
-          // eslint-disable-next-line no-console
-          console.warn('[ClearBookmarks] failed to remove folder', { id: child.id, title: child.title })
-        }
-        continue
-      }
-
-      const childSelected = selected.has(child.id)
-      if (isSelected) {
-        if (childSelected) {
-          await clearFolderContents(child, true)
-        }
-      }
-      else if (childSelected || hasSelectedDescendant(child)) {
-        await clearFolderContents(child, childSelected)
+      else {
+        // 先递归删除子节点
+        await removeAllChildren(child)
+        // 尝试删除文件夹。如果里面有残留（因为某些子节点被保护了），这一步会失败及被 catch，这是预期的。
+        await browser.bookmarks.remove(child.id).catch(() => { })
       }
     }
   }
 
-  function hasSelectedDescendant(node: browser.bookmarks.BookmarkTreeNode): boolean {
-    if (!node.children)
-      return false
-    for (const child of node.children) {
-      if (selected.has(child.id))
-        return true
-      if (hasSelectedDescendant(child))
-        return true
-    }
-    return false
+  // Reload fresh tree
+  const freshTree = await browser.bookmarks.getTree()
+  const freshRoot = freshTree[0]
+  if (!freshRoot || !freshRoot.children) return
+
+  for (const rootFolder of freshRoot.children) {
+    await removeAllChildren(rootFolder)
   }
-
-  async function runClearPass() {
-    // Re-fetch fresh bookmark tree to ensure we're working with current data
-    const freshTree = await browser.bookmarks.getTree()
-    const freshRoot = freshTree[0]
-    if (!freshRoot)
-      return
-
-    if (selected.size === 0) {
-      for (const rootFolder of freshRoot.children || [])
-        await clearFolderContents(rootFolder, true)
-      return
-    }
-
-    for (const rootFolder of freshRoot.children || [])
-      await clearFolderContents(rootFolder, selected.has(rootFolder.id))
-  }
-
-  async function countBookmarksForSelectedFresh(): Promise<number> {
-    // Re-fetch fresh bookmark tree for accurate count
-    const freshTree = await browser.bookmarks.getTree()
-    const freshRoot = freshTree[0]
-    if (!freshRoot)
-      return 0
-
-    let count = 0
-    if (selected.size === 0) {
-      for (const rootFolder of freshRoot.children || [])
-        count += countBookmarksInSubtree(rootFolder)
-      return count
-    }
-    for (const id of selected) {
-      try {
-        const subtree = await browser.bookmarks.getSubTree(id)
-        const folder = subtree[0]
-        if (folder)
-          count += countBookmarksInSubtree(folder)
-      }
-      catch {
-        // ignore missing folders
-      }
-    }
-    return count
-  }
-
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    // eslint-disable-next-line no-console
-    console.log('[ClearBookmarks] pass', { attempt: attempt + 1 })
-    await runClearPass()
-    const remaining = await countBookmarksForSelectedFresh()
-    // eslint-disable-next-line no-console
-    console.log('[ClearBookmarks] remaining bookmarks', { remaining })
-    if (remaining === 0)
-      return
-  }
-  // eslint-disable-next-line no-console
-  console.warn('[ClearBookmarks] incomplete after retries')
 }
+
+
 
 // communication example: send previous tab title from background page
 // see shim.d.ts for type declaration
@@ -1742,10 +1606,9 @@ async function performSync(mode: 'upload' | 'download') {
     const conflictStrategy = (stored['sync-conflict-strategy'] as string | undefined) || 'gist-wins'
     const concurrentSync = stored['advanced-concurrent-sync'] === true
 
-    // sync-folder-selection 可能是字符串（JSON）或数组，需要正确解析
     const selectedFolderIds = parseSelectedFolderIds(stored['sync-folder-selection'])
 
-    debugLog('performSync start', { mode, provider, selectedFolderIds })
+    debugLog('performSync start', { mode, provider })
 
     if (provider === 'webdav') {
       const baseUrl = (stored['webdav-url'] as string | undefined)?.trim()
@@ -1766,7 +1629,7 @@ async function performSync(mode: 'upload' | 'download') {
       const filePath = resolveWebDavFilePath('')
       const fileUrl = buildWebDavFileUrl(baseUrl, filePath)
 
-      const localResult = await loadLocalNodes(selectedFolderIds)
+      const localResult = await loadLocalNodes() // No args
       if (!localResult.ok)
         return await finalizeSyncResult(provider, mode, { ok: false, error: localResult.error })
 
@@ -1948,14 +1811,15 @@ async function performSync(mode: 'upload' | 'download') {
       'last-validation-time': Date.now(),
     })
 
-    const localResult = await loadLocalNodes(selectedFolderIds)
+    // 始终加载所有本地书签
+    const localResult = await loadLocalNodes()
     if (!localResult.ok)
       return await finalizeSyncResult(provider, mode, { ok: false, error: localResult.error })
 
     const { root, localNodes } = localResult
 
+    // Gist Upload logic cleanup
     if (mode === 'upload') {
-      // 上传模式：只上传选中的本地书签到云端
       const updated = await updateGistFile(token, gistId, fileName, localNodes)
       if (!updated)
         return await finalizeSyncResult(provider, mode, { ok: false, error: 'Failed to update Gist' })
@@ -1970,7 +1834,7 @@ async function performSync(mode: 'upload' | 'download') {
         'gist-last-sync-summary': summary,
         'gist-last-sync-direction': syncDirection,
         'gist-last-sync-strategy': conflictStrategy,
-        'gist-last-sync-folders': selectedFolderIds || [],
+        // 'gist-last-sync-folders': selectedFolderIds || [], // REMOVED
       })
 
       if (mode === 'upload' && concurrentSync) {
@@ -1984,13 +1848,20 @@ async function performSync(mode: 'upload' | 'download') {
       })
     }
 
-    // 下载模式：合并云端和本地书签
+    // Gist Download Mode
     bookmarkEventSuspension += 1
     try {
+      if (!gistResult.ok) throw new Error('Unexpected error: gistResult is not ok')
+
       const mergedNodes = mergeNodeLists(localNodes, gistResult.gistNodes)
 
       const index = await buildLocalIndex(root)
       await ensureLocalEntries(root.id, index, mergedNodes)
+
+      // Reorder excluded folders to the end
+      if (selectedFolderIds && selectedFolderIds.length > 0) {
+        await moveExcludedToEnd(new Set(selectedFolderIds))
+      }
 
       const mergedCount = countBookmarks(mergedNodes)
       const summary = `成功同步 ${mergedCount} 条书签`
@@ -2002,7 +1873,6 @@ async function performSync(mode: 'upload' | 'download') {
         'gist-last-sync-summary': summary,
         'gist-last-sync-direction': syncDirection,
         'gist-last-sync-strategy': conflictStrategy,
-        'gist-last-sync-folders': selectedFolderIds || [],
       })
 
       return await finalizeSyncResult(provider, mode, {
@@ -2058,6 +1928,7 @@ async function performRandomBackup(options: { isConcurrent?: boolean } = {}) {
     'advanced-backup-today-count',
     'advanced-backup-count',
     'advanced-backup-history',
+    'advanced-concurrent-scope',
   ])
 
   const enabled = stored['advanced-backup-enabled'] === true
@@ -2067,18 +1938,14 @@ async function performRandomBackup(options: { isConcurrent?: boolean } = {}) {
   const backupProvider = mainProvider === 'gist' ? 'webdav' : 'gist'
 
   // 如果是随机备份模式，需要检查是否启用；如果是并发同步模式，忽略随机备份的开关
-  // 这里不再检查 !backupProvider，因为我们动态计算保证有值
   if (!isConcurrent && !enabled) {
     debugLog('Random backup skipped: not enabled')
     return { ok: false, error: '随机备份未启用' }
   }
 
   // 检查今日备份次数是否已达上限（并发同步模式不占用次数）
-  // 动态计算今日已备份次数，避免计数器偏差
   const history = (stored['advanced-backup-history'] as string[] | undefined) || []
   const todayStr = new Date().toDateString()
-  // 只统计自动触发的随机备份（根据我们的逻辑，history里只存随机备份，不存随行备份，所以直接长度即可？
-  // 不，history里存的是时间戳。我们需要过滤出今天是日期的。
   const todayCount = history.filter(ts => new Date(ts).toDateString() === todayStr).length
 
   const targetCount = (stored['advanced-backup-count'] as number | undefined) || 3
@@ -2087,17 +1954,31 @@ async function performRandomBackup(options: { isConcurrent?: boolean } = {}) {
     return { ok: false, error: '今日备份次数已达上限' }
   }
 
-  const selectedFolderIds = parseSelectedFolderIds(stored['sync-folder-selection'])
   const provider = backupProvider as 'gist' | 'webdav'
 
   try {
     // 加载本地书签
-    const localResult = await loadLocalNodes(selectedFolderIds)
+    const localResult = await loadLocalNodes()
     if (!localResult.ok) {
       return await finalizeRandomBackupResult(provider, { ok: false, error: localResult.error })
     }
 
     const { localNodes } = localResult
+
+    // 计算内容哈希以检测变更
+    const contentHash = await computeContentHash(localNodes)
+    const hashKey = `backup-hash-${provider}`
+    const lastHash = (stored[hashKey] as string | undefined)
+
+    if (lastHash === contentHash) {
+      debugLog(`Backup skipped (${provider}): content unchanged`)
+      return await finalizeRandomBackupResult(provider, {
+        ok: true,
+        summary: '无变更，已跳过上传',
+        // 使用当前时间作为 timestamp
+        timestamp: new Date().toISOString()
+      }, isConcurrent)
+    }
 
     if (provider === 'webdav') {
       // 使用 WebDAV 备份
@@ -2141,7 +2022,10 @@ async function performRandomBackup(options: { isConcurrent?: boolean } = {}) {
         await browser.storage.local.set({
           'advanced-backup-today-count': todayCount + 1,
           'advanced-backup-history': history,
+          [hashKey]: contentHash
         })
+      } else {
+        await browser.storage.local.set({ [hashKey]: contentHash })
       }
 
       return await finalizeRandomBackupResult(provider, { ok: true, summary, timestamp }, isConcurrent)
@@ -2175,7 +2059,10 @@ async function performRandomBackup(options: { isConcurrent?: boolean } = {}) {
         await browser.storage.local.set({
           'advanced-backup-today-count': todayCount + 1,
           'advanced-backup-history': history,
+          [hashKey]: contentHash
         })
+      } else {
+        await browser.storage.local.set({ [hashKey]: contentHash })
       }
 
       return await finalizeRandomBackupResult(provider, { ok: true, summary, timestamp }, isConcurrent)
@@ -2416,6 +2303,7 @@ onMessage('random-backup-now', async () => {
 })
 
 // 获取高级备份配置
+// 获取高级备份配置
 onMessage('get-advanced-backup-config', async () => {
   const stored = await browser.storage.local.get([
     'advanced-backup-enabled',
@@ -2427,9 +2315,8 @@ onMessage('get-advanced-backup-config', async () => {
     'advanced-backup-last-date',
     'advanced-backup-history',
     'advanced-backup-next-run-time',
-    'advanced-backup-history',
-    'advanced-backup-next-run-time',
     'advanced-concurrent-sync',
+    'advanced-concurrent-scope',
   ])
 
   const today = new Date().toISOString().slice(0, 10)
@@ -2450,6 +2337,7 @@ onMessage('get-advanced-backup-config', async () => {
       history,
       nextRunTime,
       concurrentSync: stored['advanced-concurrent-sync'] === true,
+      concurrentScope: (stored['advanced-concurrent-scope'] as 'sync' | 'full') || 'sync',
     },
   }
 })
@@ -2584,6 +2472,7 @@ onMessage('webdav-download-version', async ({ data }) => {
     'webdav-url',
     'webdav-username',
     'webdav-password',
+    'sync-folder-selection',
   ])
   const baseUrl = (stored['webdav-url'] as string | undefined)?.trim()
   const username = (stored['webdav-username'] as string | undefined) || ''
@@ -2592,9 +2481,7 @@ onMessage('webdav-download-version', async ({ data }) => {
   if (!baseUrl)
     return { ok: false, error: '请先配置 WebDAV 地址' }
 
-  const selectedFolderIds: string[] = []
-
-  const localResult = await loadLocalNodes(undefined)
+  const localResult = await loadLocalNodes()
   if (!localResult.ok)
     return { ok: false, error: localResult.error }
 
@@ -2616,52 +2503,68 @@ onMessage('webdav-download-version', async ({ data }) => {
 
   bookmarkEventSuspension += 1
   try {
-    await clearLocalBookmarks(localResult.root, new Set(selectedFolderIds))
-    const refreshedLocal = await loadLocalNodes(undefined)
+    await clearLocalBookmarks(localResult.root)
+    const refreshedLocal = await loadLocalNodes()
     if (!refreshedLocal.ok)
       return { ok: false, error: refreshedLocal.error }
-    return await applyWebDavDownload(webdavResult.nodes, refreshedLocal.root, refreshedLocal.localNodes, undefined)
+
+    // 应用下载的内容
+    const result = await applyWebDavDownload(webdavResult.nodes, refreshedLocal.root, refreshedLocal.localNodes)
+
+    return result
   }
   finally {
     bookmarkEventSuspension = Math.max(0, bookmarkEventSuspension - 1)
   }
 })
 
-onMessage('open-sidepanel', ({ sender }) => {
+async function toggleSidePanel(tabId: number) {
+  // @ts-expect-error sidePanel is not typed in polyfill
+  if (!browser.sidePanel?.open)
+    return { ok: false, error: 'Side panel not supported' }
+
+  // Toggle logic based on tracked state
+  const isOpen = sidePanelOpenByTab.get(tabId) ?? false
+
+  if (isOpen) {
+    // Attempt to close via message
+    // We don't await this to keep the response fast, but we handle errors to correct state
+    await sendMessage('close-sidepanel', { tabId }, 'popup')
+      .catch(() => {
+        // If sending failed, assume it wasn't actually open or is unresponsive
+        // Correct the state so next click will try to open
+        sidePanelOpenByTab.set(tabId, false)
+      })
+    return { ok: true }
+  }
+  else {
+    // Open the panel
+    // @ts-expect-error sidePanel is not typed in polyfill
+    await browser.sidePanel.open({ tabId })
+    return { ok: true }
+  }
+}
+
+onMessage('open-sidepanel', async ({ sender }) => {
   try {
     const tabId = sender?.tabId ?? sender?.tab?.id
     if (!tabId)
       return { ok: false, error: 'No tab id from sender' }
 
-    // @ts-expect-error sidePanel is not typed in polyfill
-    if (!browser.sidePanel?.open)
-      return { ok: false, error: 'Side panel not supported' }
-
-    const isOpen = sidePanelOpenByTab.get(tabId) ?? false
-    if (isOpen) {
-      // @ts-expect-error sidePanel is not typed in polyfill
-      if (browser.sidePanel?.close) {
-        // @ts-expect-error sidePanel is not typed in polyfill
-        void browser.sidePanel.close({ tabId })
-      }
-      else {
-        // @ts-expect-error sidePanel is not typed in polyfill
-        void browser.sidePanel.setOptions?.({ tabId, enabled: false })
-      }
-      sidePanelOpenByTab.set(tabId, false)
-      return { ok: true }
-    }
-
-    // Fire immediately to preserve the user-gesture chain.
-    // @ts-expect-error sidePanel is not typed in polyfill
-    void browser.sidePanel.setOptions?.({ tabId, path: 'dist/sidepanel/index.html', enabled: true })
-    // @ts-expect-error sidePanel is not typed in polyfill
-    void browser.sidePanel.open({ tabId })
-    sidePanelOpenByTab.set(tabId, true)
-    return { ok: true }
+    return await toggleSidePanel(tabId)
   }
-  catch {
-    return { ok: false, error: 'Failed to open side panel' }
+  catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to toggle side panel', e)
+    return { ok: false, error: String(e) }
+  }
+})
+
+// Support toggling via toolbar icon
+// Note: This requires openPanelOnActionClick to be false
+browser.action.onClicked.addListener(async (tab) => {
+  if (tab.id) {
+    await toggleSidePanel(tab.id)
   }
 })
 
@@ -2729,10 +2632,31 @@ onMessage('clear-bookmarks', async () => {
     if (!root)
       return { ok: false, success: false, error: 'Failed to read bookmarks' }
 
-    await clearLocalBookmarks(root)
+    const stored = await browser.storage.local.get(['sync-folder-selection'])
+    const selectedIds = new Set(parseSelectedFolderIds(stored['sync-folder-selection']))
 
-    // 清除保存的文件夹选择状态，这样下次下载时会是全选状态
-    await browser.storage.local.remove('sync-folder-selection')
+    // Validate if selected IDs match current tree
+    if (selectedIds.size > 0) {
+      let matchFound = false
+      const checkMatch = (node: browser.bookmarks.BookmarkTreeNode) => {
+        if (matchFound)
+          return
+        if (selectedIds.has(node.id)) {
+          matchFound = true
+          return
+        }
+        node.children?.forEach(checkMatch)
+      }
+      checkMatch(root)
+
+      if (!matchFound) {
+        // eslint-disable-next-line no-console
+        console.warn('[ClearBookmarks] Configured items not found in local tree - aborting clear to protect excluded items')
+        return { ok: false, error: '同步范围失效，无法安全清除。请在设置中重新勾选同步目录。' }
+      }
+    }
+
+    await clearLocalBookmarks(root, selectedIds)
 
     return { ok: true, success: true }
   }
@@ -2746,50 +2670,20 @@ onMessage('clear-bookmarks', async () => {
 
 onMessage('export-bookmarks', async ({ data }) => {
   try {
-    const includeExcluded = data?.includeExcluded ?? true
+
 
     const localTree = await browser.bookmarks.getTree()
     const root = localTree[0]
     if (!root)
       return { ok: false, error: 'Failed to read bookmarks' }
 
-    let bookmarks: SyncNode[]
-
-    if (includeExcluded) {
-      // 导出全部书签
-      bookmarks = toSyncNodes(root.children)
-    }
-    else {
-      // 只导出选中的书签（排除未选中的）
-      const stored = await browser.storage.local.get(['sync-folder-selection'])
-      let selectedFolderIds: string[] | undefined
-      const rawSelection = stored['sync-folder-selection']
-      if (typeof rawSelection === 'string') {
-        try {
-          selectedFolderIds = JSON.parse(rawSelection)
-        }
-        catch {
-          selectedFolderIds = undefined
-        }
-      }
-      else if (Array.isArray(rawSelection)) {
-        selectedFolderIds = rawSelection
-      }
-
-      const selectedSet = new Set(selectedFolderIds || [])
-      if (selectedSet.size === 0) {
-        bookmarks = toSyncNodes(root.children)
-      }
-      else {
-        bookmarks = filterLocalNodes(root.children || [], selectedSet)
-      }
-    }
+    const bookmarks = toSyncNodes(root.children)
 
     const payload = {
       browser: navigator.userAgent,
       version: browser.runtime.getManifest().version,
       createDate: Date.now(),
-      exportType: includeExcluded ? 'full' : 'selected',
+      exportType: 'full',
       bookmarks,
     }
 
@@ -2821,3 +2715,69 @@ onMessage('import-bookmarks', async ({ data }) => {
     return { ok: false, error: String(error) }
   }
 })
+
+onMessage('get-bookmark-stats', async () => {
+  const tree = await browser.bookmarks.getTree()
+  let bookmarks = 0
+  let folders = 0
+  const walk = (nodes: browser.bookmarks.BookmarkTreeNode[]) => {
+    for (const node of nodes) {
+      if (node.url) {
+        bookmarks++
+      }
+      else {
+        // Exclude root node '0'
+        if (node.id !== '0')
+          folders++
+        if (node.children)
+          walk(node.children)
+      }
+    }
+  }
+  walk(tree)
+  return { ok: true, stats: { bookmarks, folders } }
+})
+
+async function computeContentHash(nodes: SyncNode[]): Promise<string> {
+  const str = JSON.stringify(nodes)
+  const msgBuffer = new TextEncoder().encode(str)
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer)
+  const hashArray = Array.from(new Uint8Array(hashBuffer))
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * 将 protectedIds 中的书签移动到所在父文件夹的末尾
+ * 用于防止在同步下载后，这些不想被同步影响的文件夹跑到前面去
+ */
+async function moveExcludedToEnd(protectedIds: Set<string>) {
+  if (protectedIds.size === 0) return
+
+  const toMove: string[] = []
+
+  // 遍历寻找需要移动的 ID
+  const tree = await browser.bookmarks.getTree()
+  const walk = (node: browser.bookmarks.BookmarkTreeNode) => {
+    if (protectedIds.has(node.id)) {
+      toMove.push(node.id)
+      return
+    }
+    if (node.children) {
+      node.children.forEach(walk)
+    }
+  }
+  if (tree[0].children) {
+    tree[0].children.forEach(walk)
+  }
+
+  // 执行移动
+  for (const id of toMove) {
+    try {
+      // 移动到极大索引值，即 append 到末尾
+      await browser.bookmarks.move(id, { index: 10000000 })
+    }
+    catch (e) {
+      // 忽略移动失败（例如已被手动删除）
+    }
+  }
+}

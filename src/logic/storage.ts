@@ -11,31 +11,7 @@ export const { data: gistLastSync, dataReady: gistLastSyncReady } = useWebExtens
 export const { data: gistLastSyncSummary, dataReady: gistLastSyncSummaryReady } = useWebExtensionStorage('gist-last-sync-summary', '')
 export const { data: syncDirection, dataReady: syncDirectionReady } = useWebExtensionStorage('sync-direction', 'pull')
 export const { data: syncConflictStrategy, dataReady: syncConflictStrategyReady } = useWebExtensionStorage('sync-conflict-strategy', 'gist-wins')
-const selectionSerializer = {
-  read(value: unknown) {
-    if (typeof value === 'string') {
-      try {
-        const parsed = JSON.parse(value) as string[]
-        return Array.isArray(parsed) ? parsed : []
-      }
-      catch {
-        return []
-      }
-    }
-    if (Array.isArray(value))
-      return value as string[]
-    return []
-  },
-  write(value: string[]) {
-    return JSON.stringify(value || [])
-  },
-}
 
-export const { data: syncFolderSelection, dataReady: syncFolderSelectionReady } = useWebExtensionStorage<string[]>(
-  'sync-folder-selection',
-  [],
-  { serializer: selectionSerializer },
-)
 export const { data: syncIntervalMinutes, dataReady: syncIntervalMinutesReady } = useWebExtensionStorage<number>('sync-interval-minutes', 0)
 export const { data: syncProvider, dataReady: syncProviderReady } = useWebExtensionStorage<'gist' | 'webdav'>('sync-provider', 'gist')
 

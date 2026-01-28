@@ -15,5 +15,6 @@ declare module 'webext-bridge' {
     'sync-upload': ProtocolWithReturn<undefined, { ok: boolean, summary?: string, timestamp?: string, error?: string }>
     'sync-download': ProtocolWithReturn<undefined, { ok: boolean, summary?: string, timestamp?: string, error?: string }>
     'open-sidepanel': ProtocolWithReturn<undefined, { ok: boolean, error?: string }>
+    'close-sidepanel': ProtocolWithReturn<undefined, void>
   }
 }

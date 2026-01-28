@@ -10,8 +10,7 @@ import {
   githubToken,
   githubTokenReady,
   lastValidationTime,
-  syncFolderSelection,
-  syncFolderSelectionReady,
+
   syncIntervalMinutes,
   syncIntervalMinutesReady,
   syncLogs,
@@ -28,23 +27,11 @@ import {
 } from '~/logic/storage'
 import type { SyncLogEntry } from '~/logic/storage'
 
-interface FolderNode {
-  id: string
-  title: string
-  count: number
-  children: FolderNode[]
-}
 
 const gistValidationState = ref<'idle' | 'checking' | 'ok' | 'error'>('idle')
 const webdavValidationState = ref<'idle' | 'checking' | 'ok' | 'error'>('idle')
 const uploadState = ref<'idle' | 'syncing' | 'done' | 'error'>('idle')
 const downloadState = ref<'idle' | 'syncing' | 'done' | 'error'>('idle')
-const folderTree = ref<FolderNode[]>([])
-const folderTreeState = ref<'idle' | 'loading' | 'error'>('idle')
-const folderTreeMessage = ref('')
-const selectedFolderIds = ref(new Set<string>())
-const savedFolderIds = ref(new Set<string>()) // 已保存的选择，用于统计
-const syncScopeExpanded = ref(false)
 const currentTabId = ref<number | null>(null)
 const webdavVersionsVisible = ref(false)
 const webdavVersionsState = ref<'idle' | 'loading' | 'error'>('idle')
@@ -62,7 +49,6 @@ const syncLogVisible = ref(false)
 const syncLogReady = ref(false)
 const syncLogError = ref('')
 const exportModalVisible = ref(false)
-const exportIncludeExcluded = ref(true)
 
 // 隐藏页面列表
 const hiddenPagesVisible = ref(false)
@@ -78,6 +64,7 @@ const advancedSettingsLoading = ref(false)
 const advancedSettingsSaving = ref(false)
 const advancedBackupEnabled = ref(false)
 const advancedConcurrentSync = ref(false)
+
 const advancedBackupProvider = ref<'gist' | 'webdav' | ''>('')
 const advancedBackupStartHour = ref(9)
 const advancedBackupEndHour = ref(18)
@@ -92,6 +79,7 @@ const endHourDropdownOpen = ref(false)
 const countDropdownOpen = ref(false)
 
 
+
 // WebDAV 协议选择
 const webdavProtocol = ref<'https' | 'http'>('https')
 const protocolDropdownOpen = ref(false)
@@ -99,6 +87,31 @@ const protocolDropdownRef = ref<HTMLElement | null>(null)
 const protocolDropdownTriggerRef = ref<HTMLElement | null>(null)
 const protocolDropdownMenuRef = ref<HTMLElement | null>(null)
 const protocolDropdownStyle = ref<Record<string, string>>({})
+
+// 书签统计
+const bookmarkStats = ref({ bookmarks: 0, folders: 0 })
+
+async function loadBookmarkStats() {
+  try {
+    // 也可以直接在 Sidepanel 调用 browser.bookmarks.getTree，但既然 Background 已经有了，就调用它
+    const res = await safeSendMessage('get-bookmark-stats', null, 'background')
+    if (res.ok && res.stats) {
+      bookmarkStats.value = res.stats
+    }
+  } catch (e) {
+    console.error('Failed to load stats', e)
+  }
+}
+
+function setupBookmarkStatsListeners() {
+  loadBookmarkStats()
+  // 监听书签变化实时更新
+  const update = () => loadBookmarkStats()
+  browser.bookmarks.onCreated.addListener(update)
+  browser.bookmarks.onRemoved.addListener(update)
+  browser.bookmarks.onMoved.addListener(update)
+}
+
 
 function stripWebdavProtocol(value: string) {
   return value.replace(/^https?:\/\//, '')
@@ -276,7 +289,7 @@ async function positionIntervalDropdown() {
   const viewportHeight = window.innerHeight
 
   // 先让菜单实际渲染以获取高度
-  const menuHeight = Math.min(menu.scrollHeight, 260)
+  const menuHeight = Math.min(menu.scrollHeight, 150)
   let top = rect.bottom + 8
   if (top + menuHeight > viewportHeight - 8)
     top = Math.max(8, rect.top - 8 - menuHeight)
@@ -306,14 +319,14 @@ function addIntervalDropdownListeners() {
   window.addEventListener('click', handleIntervalDropdownOutside)
   window.addEventListener('keydown', handleIntervalEsc)
   window.addEventListener('resize', handleIntervalResize)
-  window.addEventListener('scroll', handleIntervalScroll, { passive: true })
+  window.addEventListener('scroll', handleIntervalScroll, true)
 }
 
 function removeIntervalDropdownListeners() {
   window.removeEventListener('click', handleIntervalDropdownOutside)
   window.removeEventListener('keydown', handleIntervalEsc)
   window.removeEventListener('resize', handleIntervalResize)
-  window.removeEventListener('scroll', handleIntervalScroll)
+  window.removeEventListener('scroll', handleIntervalScroll, true)
 }
 
 // 协议下拉菜单控制
@@ -357,7 +370,7 @@ async function positionProtocolDropdown() {
   }
   const rect = trigger.getBoundingClientRect()
   const viewportHeight = window.innerHeight
-  const menuHeight = Math.min(menu.scrollHeight, 120)
+  const menuHeight = Math.min(menu.scrollHeight, 150)
   let top = rect.bottom + 4
   if (top + menuHeight > viewportHeight - 8)
     top = Math.max(8, rect.top - 4 - menuHeight)
@@ -417,6 +430,7 @@ function handleSidepanelHide() {
 }
 
 onMounted(() => {
+  setupBookmarkStatsListeners()
   void notifySidepanelOpen()
   window.addEventListener('pagehide', handleSidepanelHide)
   window.addEventListener('beforeunload', handleSidepanelHide)
@@ -432,6 +446,31 @@ onMounted(() => {
     syncLogError.value = error instanceof Error ? error.message : String(error)
     console.error('[GistSync][Sidepanel] syncLogs load error', error)
   })
+
+  // Listen for close request from background (triggered by shortcut/button)
+  // Listen for close request from background (triggered by shortcut/button)
+  onMessage('close-sidepanel', async ({ data }) => {
+    const targetTabId = (data as { tabId?: number } | undefined)?.tabId
+    // If no specific tab targeted, close immediately
+    if (!targetTabId) {
+      window.close()
+      return
+    }
+
+    // Verify if the target tab is the active one in the window this sidepanel is attached to
+    try {
+      const tabs = await browser.tabs.query({ active: true, currentWindow: true })
+      const activeTab = tabs[0]
+      if (activeTab && activeTab.id === targetTabId) {
+        window.close()
+      }
+    }
+    catch (e) {
+      // In case of query error, fail safe (don't close unexpectedly) or just close? 
+      // Safe to ignore if we can't verify.
+    }
+  })
+
   watch(syncLogs, () => {
     syncLogReady.value = true
   }, { immediate: true })
@@ -461,16 +500,7 @@ onBeforeUnmount(() => {
   setScrollLock(false)
 })
 
-// 检测同步范围是否有未保存的变化
-const hasUnsavedChanges = computed(() => {
-  if (selectedFolderIds.value.size !== savedFolderIds.value.size)
-    return true
-  for (const id of selectedFolderIds.value) {
-    if (!savedFolderIds.value.has(id))
-      return true
-  }
-  return false
-})
+
 
 // Toast 通知
 const toastVisible = ref(false)
@@ -490,46 +520,8 @@ function showToast(message: string, type: 'success' | 'error' = 'success') {
 }
 
 // 计算选中和排除的书签数量
-// node.count 是该文件夹及其所有子文件夹的书签总数
-function countSelectedBookmarks(nodes: FolderNode[], selected: Set<string>): { selected: number, total: number } {
-  let selectedCount = 0
-  let totalCount = 0
+// 计算选中和排除的书签数量
 
-  for (const node of nodes) {
-    // 计算子文件夹的书签总数
-    let childrenCount = 0
-    for (const child of node.children) {
-      childrenCount += child.count
-    }
-
-    // 该文件夹直接包含的书签数 = node.count - 子文件夹书签总数
-    const directCount = node.count - childrenCount
-    totalCount += directCount
-    if (selected.has(node.id))
-      selectedCount += directCount
-
-    // 递归处理子文件夹
-    if (node.children.length > 0) {
-      const childResult = countSelectedBookmarks(node.children, selected)
-      selectedCount += childResult.selected
-      totalCount += childResult.total
-    }
-  }
-
-  return { selected: selectedCount, total: totalCount }
-}
-
-const bookmarkStats = computed(() => {
-  const result = countSelectedBookmarks(folderTree.value, savedFolderIds.value)
-  const excluded = result.total - result.selected
-  const coverage = result.total > 0 ? Math.round((result.selected / result.total) * 100) : 0
-  return {
-    selected: result.selected,
-    total: result.total,
-    excluded,
-    coverage,
-  }
-})
 
 // 验证间隔时间（1小时）
 const VALIDATION_INTERVAL = 60 * 60 * 1000
@@ -788,7 +780,7 @@ async function downloadBookmarks(options?: { silent?: boolean }) {
       downloadState.value = 'done'
       if (!options?.silent)
         showToast(result.summary || '拉取成功', 'success')
-      void loadFolderTree()
+
       return
     }
 
@@ -873,7 +865,7 @@ async function downloadWebdavVersion(file: string) {
     if (result.ok) {
       downloadState.value = 'done'
       showToast(result.summary || '回退成功', 'success')
-      void loadFolderTree()
+
       return
     }
 
@@ -946,9 +938,10 @@ function exportConfig() {
     webdavUsername: webdavUsername.value,
     webdavPassword: webdavPassword.value,
     syncIntervalMinutes: syncIntervalMinutes.value,
-    syncFolderSelection: Array.from(selectedFolderIds.value),
+
     advancedBackupEnabled: advancedBackupEnabled.value,
     advancedConcurrentSync: advancedConcurrentSync.value,
+
     advancedBackupProvider: advancedBackupProvider.value,
     advancedBackupStartHour: advancedBackupStartHour.value,
     advancedBackupEndHour: advancedBackupEndHour.value,
@@ -973,6 +966,12 @@ function importConfig() {
     const file = (e.target as HTMLInputElement).files?.[0]
     if (!file)
       return
+    
+    // 简单校验文件名
+    if (!file.name.toLowerCase().includes('config')) {
+      showToast('请选择配置文件 (通常包含 "config")', 'error')
+      return
+    }
     try {
       const text = await file.text()
       const config = JSON.parse(text)
@@ -998,10 +997,7 @@ function importConfig() {
         webdavPassword.value = config.webdavPassword
       if (typeof config.syncIntervalMinutes === 'number')
         syncIntervalMinutes.value = config.syncIntervalMinutes
-      if (Array.isArray(config.syncFolderSelection)) {
-        syncFolderSelection.value = config.syncFolderSelection
-        selectedFolderIds.value = new Set(config.syncFolderSelection)
-      }
+
       if (typeof config.advancedBackupEnabled === 'boolean')
         advancedBackupEnabled.value = config.advancedBackupEnabled
       if (config.advancedBackupProvider === 'gist' || config.advancedBackupProvider === 'webdav')
@@ -1014,6 +1010,8 @@ function importConfig() {
         advancedBackupCount.value = config.advancedBackupCount
       if (typeof config.advancedConcurrentSync === 'boolean')
         advancedConcurrentSync.value = config.advancedConcurrentSync
+
+
       const storagePayload: Record<string, unknown> = {}
       if (config.syncProvider === 'webdav' || config.syncProvider === 'gist')
         storagePayload['sync-provider'] = config.syncProvider
@@ -1046,6 +1044,7 @@ function importConfig() {
         storagePayload['advanced-backup-count'] = config.advancedBackupCount
       if (typeof config.advancedConcurrentSync === 'boolean')
         storagePayload['advanced-concurrent-sync'] = config.advancedConcurrentSync
+
 
       // 导入隐藏的域名列表 - 合并模式，不会覆盖现有的
       // browser.storage.local.set() 只会更新/添加 keys，不会删除其他 keys
@@ -1112,12 +1111,7 @@ async function handleImportSyncFlow() {
     void checkWebdavConnection(true)
   else
     void checkConnection(true)
-  await loadFolderTree()
-  const allIds = collectAllFolderIds(folderTree.value)
-  selectedFolderIds.value = new Set(allIds)
-  syncFolderSelection.value = allIds
-  savedFolderIds.value = new Set(allIds)
-  await browser.storage.local.set({ 'sync-folder-selection': allIds })
+
   showToast('配置已导入并刷新同步范围', 'success')
 }
 
@@ -1125,10 +1119,11 @@ function showExportModal() {
   exportModalVisible.value = true
 }
 
+
 async function doExportBookmarks() {
   exportModalVisible.value = false
   try {
-    const result = await safeSendMessage('export-bookmarks', { includeExcluded: exportIncludeExcluded.value }, 'background') as { ok: boolean, error?: string, data?: unknown, count?: number }
+    const result = await safeSendMessage('export-bookmarks', { includeExcluded: true }, 'background') as { ok: boolean, error?: string, data?: unknown, count?: number }
     if (!result.ok) {
       showToast(result.error || '导出失败', 'error')
       return
@@ -1138,8 +1133,7 @@ async function doExportBookmarks() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    const suffix = exportIncludeExcluded.value ? 'full' : 'selected'
-    a.download = `bookmarks-${suffix}-${new Date().toISOString().slice(0, 10)}.json`
+    a.download = `bookmarks-${new Date().toISOString().slice(0, 10)}.json`
     a.click()
     URL.revokeObjectURL(url)
     showToast(`已导出 ${result.count} 条书签`, 'success')
@@ -1148,6 +1142,7 @@ async function doExportBookmarks() {
     showToast(error instanceof Error ? error.message : '导出失败', 'error')
   }
 }
+
 
 // 书签导入
 function importBookmarks() {
@@ -1158,6 +1153,12 @@ function importBookmarks() {
     const file = (e.target as HTMLInputElement).files?.[0]
     if (!file)
       return
+
+    // 简单校验文件名
+    if (!file.name.toLowerCase().includes('bookmark')) {
+      showToast('请选择书签文件 (通常包含 "bookmark")', 'error')
+      return
+    }
     try {
       const text = await file.text()
       const data = JSON.parse(text)
@@ -1172,7 +1173,7 @@ function importBookmarks() {
       const result = await safeSendMessage('import-bookmarks', { bookmarks }, 'background') as { ok: boolean, error?: string, count?: number }
       if (result.ok) {
         showToast(`已导入 ${result.count} 条书签`, 'success')
-        void loadFolderTree()
+  
       }
       else {
         showToast(result.error || '导入失败', 'error')
@@ -1306,6 +1307,16 @@ async function openAdvancedSettings() {
 /**
  * 加载高级备份配置
  */
+// 高级设置下拉菜单
+// (variables declared at top of file)
+
+
+// ...
+
+
+/**
+ * 加载高级备份配置
+ */
 async function loadAdvancedBackupConfig() {
   advancedSettingsLoading.value = true
   try {
@@ -1313,6 +1324,8 @@ async function loadAdvancedBackupConfig() {
     if (result.ok && result.config) {
       advancedBackupEnabled.value = result.config.enabled
       advancedConcurrentSync.value = result.config.concurrentSync ?? false
+      // 默认使用'sync'范围
+
       // 如果没有配置 provider，默认使用备用 provider
       advancedBackupProvider.value = result.config.provider || alternateProvider.value
       advancedBackupStartHour.value = result.config.startHour
@@ -1336,17 +1349,31 @@ async function loadAdvancedBackupConfig() {
  */
 async function saveAdvancedBackupConfig() {
   advancedSettingsSaving.value = true
+  // 先清空预计时间，以便重新获取
+  advancedBackupNextRunTime.value = undefined 
   try {
     const result = await safeSendMessage('update-advanced-backup-config', {
       enabled: advancedBackupEnabled.value,
       concurrentSync: advancedConcurrentSync.value,
+
       provider: advancedBackupProvider.value,
       startHour: advancedBackupStartHour.value,
       endHour: advancedBackupEndHour.value,
       count: advancedBackupCount.value,
     }, 'background')
+    
     if (result.ok) {
       showToast('高级设置已保存', 'success')
+      // 保存成功后立即尝试刷新预计时间（重新加载配置）
+      // 等待一点时间让后台调度完成
+      setTimeout(async () => {
+         try {
+           const refreshResult = await safeSendMessage('get-advanced-backup-config', null, 'background')
+           if (refreshResult.ok && refreshResult.config) {
+             advancedBackupNextRunTime.value = refreshResult.config.nextRunTime
+           }
+         } catch(e) { /* ignore */ }
+      }, 500)
     }
     else {
       showToast(result.error || '保存失败', 'error')
@@ -1361,6 +1388,7 @@ async function saveAdvancedBackupConfig() {
 }
 
 function formatTime(val: string | number) {
+  if (!val) return '等待调度'
   const date = new Date(val)
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
@@ -1405,6 +1433,100 @@ const backupCountOptions = [
   { value: 10, label: '10 次' },
 ]
 
+// Advanced Dropdown Refs & Styles
+const startHourTriggerRef = ref<HTMLElement | null>(null)
+const endHourTriggerRef = ref<HTMLElement | null>(null)
+const countTriggerRef = ref<HTMLElement | null>(null)
+
+const startHourDropdownStyle = ref<Record<string, string>>({})
+const endHourDropdownStyle = ref<Record<string, string>>({})
+const countDropdownStyle = ref<Record<string, string>>({})
+
+function updateAdvDropdownPosition(trigger: HTMLElement | null, styleRef: Ref<Record<string, string>>) {
+  if (!trigger) return
+  const rect = trigger.getBoundingClientRect()
+  
+  // Decide if menu should go up (if closer to bottom edge)
+  const windowHeight = window.innerHeight
+  const spaceBelow = windowHeight - rect.bottom
+  const menuHeightApprox = 120 // max-height is 120px (about 4 items)
+  
+  let top = rect.bottom + 4
+  let transformOrigin = 'top center'
+  
+  if (spaceBelow < menuHeightApprox && rect.top > menuHeightApprox) {
+    // Show above
+    top = rect.top - 4 - menuHeightApprox // This might be tricky if height is dynamic. 
+    // Easier approach: Use bottom property if fixed positioning.
+    // But let's stick to 'top' and rely on enough space or scroll. 
+    // Actually, simple downward expansion is usually fine in sidepanel unless at very bottom.
+    // If user says "it gets covered", teleport fixes the "covered by other element" issue.
+    // "Covered by viewport edge" is another issue.
+    // Let's stick to downward for now as it's standard, teleport fixes z-index clipping.
+  }
+
+  styleRef.value = {
+    position: 'fixed',
+    top: `${top}px`,
+    left: `${rect.left}px`,
+    minWidth: `${rect.width}px`,
+    zIndex: '999999',
+  }
+}
+
+function toggleStartHourDropdown() {
+  if (startHourDropdownOpen.value) {
+    startHourDropdownOpen.value = false
+    return
+  }
+  closeAllAdvancedDropdowns()
+  updateAdvDropdownPosition(startHourTriggerRef.value, startHourDropdownStyle)
+  startHourDropdownOpen.value = true
+}
+
+function toggleEndHourDropdown() {
+  if (endHourDropdownOpen.value) {
+    endHourDropdownOpen.value = false
+    return
+  }
+  closeAllAdvancedDropdowns()
+  updateAdvDropdownPosition(endHourTriggerRef.value, endHourDropdownStyle)
+  endHourDropdownOpen.value = true
+}
+
+function toggleCountDropdown() {
+  if (countDropdownOpen.value) {
+    countDropdownOpen.value = false
+    return
+  }
+  closeAllAdvancedDropdowns()
+  updateAdvDropdownPosition(countTriggerRef.value, countDropdownStyle)
+  countDropdownOpen.value = true
+}
+
+function handleAdvScroll() {
+  if (startHourDropdownOpen.value) updateAdvDropdownPosition(startHourTriggerRef.value, startHourDropdownStyle)
+  if (endHourDropdownOpen.value) updateAdvDropdownPosition(endHourTriggerRef.value, endHourDropdownStyle)
+  if (countDropdownOpen.value) updateAdvDropdownPosition(countTriggerRef.value, countDropdownStyle)
+}
+
+function handleAdvOutsideClick() {
+  closeAllAdvancedDropdowns()
+}
+
+watch([startHourDropdownOpen, endHourDropdownOpen, countDropdownOpen], ([s, e, c]) => {
+  if (s || e || c) {
+    window.addEventListener('scroll', handleAdvScroll, true)
+    window.addEventListener('resize', handleAdvScroll)
+    window.addEventListener('click', handleAdvOutsideClick)
+  }
+  else {
+    window.removeEventListener('scroll', handleAdvScroll, true)
+    window.removeEventListener('resize', handleAdvScroll)
+    window.removeEventListener('click', handleAdvOutsideClick)
+  }
+})
+
 /**
  * 选择开始小时
  */
@@ -1439,196 +1561,18 @@ function closeAllAdvancedDropdowns() {
 }
 
 
-function collectFolderIds(nodes: FolderNode[]) {
-  const ids: string[] = []
-  for (const node of nodes) {
-    ids.push(node.id)
-    if (node.children.length)
-      ids.push(...collectFolderIds(node.children))
-  }
-  return ids
-}
 
-// 自动刷新书签树和选中状态
-watch(syncScopeExpanded, async (expanded) => {
-  if (expanded) {
-    await loadFolderTree()
-  }
-})
 
-/**
- * 智能规范化选中状态：
- * 1. 强制父子一致性检查
- * 2. 只有当文件夹是“全新”（不在已知快照中）时，才继承父级的选中状态
- * 3. 否则严格尊重 selected 集合（即保留用户的排除操作）
- */
-function normalizeSelection(
-  nodes: FolderNode[], 
-  selected: Set<string>, 
-  snapshot: Set<string>, 
-  parentSelected = true
-) {
-  for (const node of nodes) {
-    const isExplicitlySelected = selected.has(node.id)
-    const isKnown = snapshot.has(node.id) // 是否是已知文件夹（旧文件夹）
-    
-    let isSelected = false
 
-    if (isExplicitlySelected) {
-      // 如果显式选中，那就选中
-      isSelected = true
-    } else if (!isKnown && parentSelected) {
-      // 关键逻辑：如果是新文件夹（未知），且父级被选中 -> 自动选中
-      // 这解决了“新建文件夹没被同步”的问题，同时不覆盖“手动排除的旧文件夹”
-      isSelected = true
-      selected.add(node.id)
-    } else {
-      // 既没显式选中，也不是新文件夹（说明是被排除的旧文件夹），或者父级没选中
-      isSelected = false
-    }
-    
-    // 如果最终判定为不选中，从集合移除
-    if (!isSelected) {
-      selected.delete(node.id)
-    }
-
-    if (node.children?.length) {
-      normalizeSelection(node.children, selected, snapshot, isSelected)
-    }
-  }
-}
-
-function setNodeSelection(node: FolderNode, checked: boolean) {
-  if (checked)
-    selectedFolderIds.value.add(node.id)
-  else
-    selectedFolderIds.value.delete(node.id)
-
-  for (const child of node.children)
-    setNodeSelection(child, checked)
-}
-
-function toggleFolder(node: FolderNode, checked: boolean) {
-  setNodeSelection(node, checked)
-  selectedFolderIds.value = new Set(selectedFolderIds.value)
-}
-
-async function loadFolderTree() {
-  folderTreeState.value = 'loading'
-  folderTreeMessage.value = ''
-
-  try {
-    // 并行加载书签树和配置
-    const [treeResult, storageResult] = await Promise.all([
-      safeSendMessage('get-bookmark-folders', null, 'background'),
-      browser.storage.local.get(['sync-folder-selection', 'sync-folder-snapshot'])
-    ])
-
-    if (!treeResult.ok) {
-      folderTreeState.value = 'error'
-      folderTreeMessage.value = treeResult.error || 'Failed to load bookmarks'
-      return
-    }
-
-    folderTree.value = (treeResult.tree as FolderNode[]) || []
-    
-    // 加载已选列表
-    const storedSelection = storageResult['sync-folder-selection']
-    const stored = Array.isArray(storedSelection) 
-      ? storedSelection 
-      : (JSON.parse((storedSelection as string) || '[]') as string[]) // 兼容字符串格式
-
-    // 加载已知快照 (Snapshot)
-    const storedSnapshot = storageResult['sync-folder-snapshot']
-    const snapshot = new Set(Array.isArray(storedSnapshot) ? storedSnapshot : [])
-
-    const selected = new Set<string>(stored)
-    
-    // 首次初始化：如果没有任何配置，默认全选
-    if (selected.size === 0 && snapshot.size === 0) {
-      for (const id of collectFolderIds(folderTree.value))
-        selected.add(id)
-    } else if (snapshot.size === 0) {
-      // 兼容老用户：如果有选区但没快照，将当前树的所有ID视为快照（避免旧的排除项被误判为“新文件夹”而自动勾选）
-      // 这样第一次加载不会有“新文件夹自动勾选”的效果，但保证了安全。
-      // 用户保存一次后，快照建立，之后的新文件夹就会生效。
-      for (const id of collectFolderIds(folderTree.value))
-        snapshot.add(id)
-    }
-
-    // 执行智能规范化
-    // 根节点调用：parentSelected=true，允许根目录下的新文件夹自动被选中
-    normalizeSelection(folderTree.value, selected, snapshot, true)
-    
-    // 保存计算后的选中状态
-    selectedFolderIds.value = selected
-    savedFolderIds.value = new Set(selected) 
-    folderTreeState.value = 'idle'
-    
-    // 此时不进行自动保存，等待用户确认或触发保存操作时再更新快照
-  }
-  catch (error) {
-    folderTreeState.value = 'error'
-    folderTreeMessage.value = error instanceof Error ? error.message : 'Failed to load bookmarks'
-  }
-}
-
-async function saveFolderSelection() {
-  const selection = Array.from(selectedFolderIds.value)
-  // 同时生成当前所有ID的快照
-  const currentSnapshot = collectFolderIds(folderTree.value)
-  
-  syncFolderSelection.value = selection
-  savedFolderIds.value = new Set(selection)
-  
-  // 保存 selection 和 snapshot
-  await browser.storage.local.set({ 
-    'sync-folder-selection': JSON.stringify(selection),
-    'sync-folder-snapshot': currentSnapshot // 保存为数组
-  })
-  
-  void triggerUploadAfterSave()
-}
-
-async function triggerUploadAfterSave() {
-  if (syncProvider.value === 'webdav') {
-    if (!webdavUrl.value?.trim()) {
-      showToast('同步范围已保存', 'success')
-      return
-    }
-  }
-  else {
-    if (!githubToken.value?.trim() || !gistId.value?.trim() || !gistFileName.value?.trim()) {
-      showToast('同步范围已保存', 'success')
-      return
-    }
-  }
-
-  try {
-    uploadState.value = 'syncing'
-    const result = await safeSendMessage('sync-upload', null, 'background')
-    if (result.ok) {
-      uploadState.value = 'done'
-      showToast(result.summary || '同步范围已保存并推送', 'success')
-      return
-    }
-    uploadState.value = 'error'
-    showToast(result.error || '同步范围已保存，但推送失败', 'error')
-  }
-  catch (error) {
-    uploadState.value = 'error'
-    showToast(error instanceof Error ? error.message : '同步范围已保存，但推送失败', 'error')
-  }
-}
 
 onMounted(() => {
-  void loadFolderTree()
   // 等待所有配置数据加载完成后恢复连接状态
   Promise.all([githubTokenReady, gistIdReady, connectionStatusReady]).then(() => {
     // 恢复之前保存的连接状态
     if (connectionStatus.value === 'ok') {
       gistValidationState.value = 'ok'
     }
+
     else if (connectionStatus.value === 'error') {
       gistValidationState.value = 'error'
     }
@@ -1655,7 +1599,7 @@ onMounted(() => {
       syncProvider.value = 'gist'
   })
 
-  Promise.all([syncProviderReady, githubTokenReady, gistIdReady, webdavUrlReady, syncFolderSelectionReady, syncIntervalMinutesReady]).then(() => {
+  Promise.all([syncProviderReady, githubTokenReady, gistIdReady, webdavUrlReady, syncIntervalMinutesReady]).then(() => {
     void autoPullOnOpen()
   })
 })
@@ -1721,9 +1665,21 @@ watch(protocolDropdownOpen, (open) => {
             <h1 class="panel__title">
               {{ providerTitle }}
             </h1>
-            <p class="panel__subtitle">
-              {{ providerSubtitle }}
-            </p>
+            <div class="panel__info-row">
+              <template v-if="bookmarkStats.bookmarks > 0 || bookmarkStats.folders > 0">
+                <div class="panel__stat-item">
+                  <ph-bookmark-simple weight="fill" class="panel__stat-icon" />
+                  <span>{{ bookmarkStats.bookmarks }} 书签</span>
+                </div>
+                <div class="panel__stat-item">
+                  <ph-folder weight="fill" class="panel__stat-icon" />
+                  <span>{{ bookmarkStats.folders }} 文件夹</span>
+                </div>
+              </template>
+              <p v-else class="panel__subtitle">
+                {{ providerSubtitle }}
+              </p>
+            </div>
           </div>
         </Transition>
       </div>
@@ -1742,23 +1698,9 @@ watch(protocolDropdownOpen, (open) => {
       </div>
     </header>
 
-    <div class="stats">
-      <div class="stats__item">
-        <span class="stats__label">已选书签</span>
-        <span class="stats__value">
-          <span class="stats__highlight">{{ bookmarkStats.selected }}</span>
-          <span class="stats__total">/ {{ bookmarkStats.total }}</span>
-        </span>
-      </div>
-      <div class="stats__item">
-        <span class="stats__label">已排除书签</span>
-        <span class="stats__value">{{ bookmarkStats.excluded }}</span>
-      </div>
-      <div class="stats__item">
-        <span class="stats__label">覆盖率</span>
-        <span class="stats__value stats__value--accent">{{ bookmarkStats.coverage }}%</span>
-      </div>
-    </div>
+
+
+
 
     <section class="card">
       <div class="card__header">
@@ -1856,7 +1798,6 @@ watch(protocolDropdownOpen, (open) => {
                       @click.stop="selectInterval(option.value)"
                     >
                       <span>{{ option.label }}</span>
-                      <ph-check v-if="option.value === syncIntervalMinutes" class="select-option__check" />
                     </button>
                   </div>
                 </teleport>
@@ -1977,7 +1918,6 @@ watch(protocolDropdownOpen, (open) => {
                       @click.stop="selectInterval(option.value)"
                     >
                       <span>{{ option.label }}</span>
-                      <ph-check v-if="option.value === syncIntervalMinutes" class="select-option__check" />
                     </button>
                   </div>
                 </teleport>
@@ -2042,48 +1982,7 @@ watch(protocolDropdownOpen, (open) => {
 
 
 
-    <section class="card" :class="{ 'is-expanded': syncScopeExpanded }">
-      <div class="card__header card__header--collapsible" @click="syncScopeExpanded = !syncScopeExpanded">
-        <ph-folder-open class="card__icon" />
-        <h2 class="card__title">
-          同步范围
-        </h2>
-        <div class="card__header-actions" @click.stop>
-          <button class="btn btn--ghost" :disabled="folderTreeState === 'loading'" @click="loadFolderTree">
-            <ph-arrows-clockwise class="btn__icon" :class="{ 'btn__icon--spin': folderTreeState === 'loading' }" />
-          </button>
-          <button class="btn btn--ghost" @click="saveFolderSelection">
-            <ph-floppy-disk class="btn__icon" />
-            保存
-            <span v-if="hasUnsavedChanges" class="unsaved-dot" />
-          </button>
-        </div>
-        <ph-caret-down class="card__collapse-icon" :class="{ 'is-rotated': syncScopeExpanded }" />
-      </div>
-      <Transition name="expand">
-        <div v-if="syncScopeExpanded" class="card__collapsible-wrapper">
-          <div class="card__collapsible-content">
-            <p class="card__hint">
-              选择需要同步的书签文件夹
-            </p>
-            <div v-if="folderTreeState === 'loading' && folderTree.length === 0" class="tree-loading">
-              <ph-circle-notch class="tree-loading__icon" />
-              <span>加载书签…</span>
-            </div>
-            <div v-else-if="folderTreeState === 'error'" class="message" data-state="error">
-              {{ folderTreeMessage }}
-            </div>
-            <div v-else class="tree-container" :class="{ 'tree-container--loading': folderTreeState === 'loading' }">
-              <FolderTree
-                :nodes="folderTree"
-                :selected-ids="Array.from(selectedFolderIds)"
-                @toggle="toggleFolder"
-              />
-            </div>
-          </div>
-        </div>
-      </Transition>
-    </section>
+
 
     <!-- Toast 通知 -->
     <Transition name="toast">
@@ -2107,24 +2006,13 @@ watch(protocolDropdownOpen, (open) => {
               <ph-x />
             </button>
           </div>
-          <div class="modal__body">
-            <label class="radio-option">
-              <input v-model="exportIncludeExcluded" type="radio" :value="true" class="radio-option__input">
-              <span class="radio-option__mark" />
-              <span class="radio-option__content">
-                <span class="radio-option__label">导出全部书签</span>
-                <span class="radio-option__hint">包含所有书签，共 {{ bookmarkStats.total }} 条</span>
-              </span>
-            </label>
-            <label class="radio-option">
-              <input v-model="exportIncludeExcluded" type="radio" :value="false" class="radio-option__input">
-              <span class="radio-option__mark" />
-              <span class="radio-option__content">
-                <span class="radio-option__label">仅导出已选书签</span>
-                <span class="radio-option__hint">排除未选中的文件夹，共 {{ bookmarkStats.selected }} 条</span>
-              </span>
-            </label>
-          </div>
+
+    <div class="modal__body">
+      <p class="modal__message">
+        将导出所有本地书签。
+      </p>
+    </div>
+
           <div class="modal__footer">
             <button class="btn btn--ghost" @click="exportModalVisible = false">
               取消
@@ -2379,6 +2267,8 @@ watch(protocolDropdownOpen, (open) => {
                 </label>
               </div>
 
+
+
               <!-- 启用开关 -->
               <div class="advanced-field">
                 <label class="advanced-field__label">
@@ -2419,52 +2309,64 @@ watch(protocolDropdownOpen, (open) => {
                   <!-- 开始时间下拉菜单 -->
                   <div class="adv-dropdown" @click.stop>
                     <button
+                      ref="startHourTriggerRef"
                       class="adv-dropdown__trigger"
                       :class="{ 'is-open': startHourDropdownOpen }"
-                      @click="startHourDropdownOpen = !startHourDropdownOpen; endHourDropdownOpen = false; countDropdownOpen = false"
+                      @click="toggleStartHourDropdown"
                     >
                       <span>{{ formatHour(advancedBackupStartHour) }}</span>
                       <ph-caret-down class="adv-dropdown__caret" />
                     </button>
                     <Transition name="dropdown">
-                      <div v-if="startHourDropdownOpen" class="adv-dropdown__menu adv-dropdown__menu--scroll">
-                        <button
-                          v-for="opt in hourOptions"
-                          :key="opt.value"
-                          class="adv-dropdown__option"
-                          :class="{ 'is-selected': opt.value === advancedBackupStartHour }"
-                          @click="selectStartHour(opt.value)"
+                      <teleport to="body">
+                        <div
+                          v-if="startHourDropdownOpen"
+                          class="adv-dropdown__menu adv-dropdown__menu--scroll"
+                          :style="startHourDropdownStyle"
                         >
-                          {{ opt.label }}
-                          <ph-check v-if="opt.value === advancedBackupStartHour" class="adv-dropdown__check" />
-                        </button>
-                      </div>
+                          <button
+                            v-for="opt in hourOptions"
+                            :key="opt.value"
+                            class="adv-dropdown__option"
+                            :class="{ 'is-selected': opt.value === advancedBackupStartHour }"
+                            @click="selectStartHour(opt.value)"
+                          >
+                            {{ opt.label }}
+                          </button>
+                        </div>
+                      </teleport>
                     </Transition>
                   </div>
                   <span class="time-range__sep">至</span>
                   <!-- 结束时间下拉菜单 -->
                   <div class="adv-dropdown" @click.stop>
                     <button
+                      ref="endHourTriggerRef"
                       class="adv-dropdown__trigger"
                       :class="{ 'is-open': endHourDropdownOpen }"
-                      @click="endHourDropdownOpen = !endHourDropdownOpen; startHourDropdownOpen = false; countDropdownOpen = false"
+                      @click="toggleEndHourDropdown"
                     >
                       <span>{{ formatHour(advancedBackupEndHour) }}</span>
                       <ph-caret-down class="adv-dropdown__caret" />
                     </button>
                     <Transition name="dropdown">
-                      <div v-if="endHourDropdownOpen" class="adv-dropdown__menu adv-dropdown__menu--scroll">
-                        <button
-                          v-for="opt in hourOptions"
-                          :key="opt.value"
-                          class="adv-dropdown__option"
-                          :class="{ 'is-selected': opt.value === advancedBackupEndHour }"
-                          @click="selectEndHour(opt.value)"
+                      <teleport to="body">
+                        <div
+                          v-if="endHourDropdownOpen"
+                          class="adv-dropdown__menu adv-dropdown__menu--scroll"
+                          :style="endHourDropdownStyle"
                         >
-                          {{ opt.label }}
-                          <ph-check v-if="opt.value === advancedBackupEndHour" class="adv-dropdown__check" />
-                        </button>
-                      </div>
+                          <button
+                            v-for="opt in hourOptions"
+                            :key="opt.value"
+                            class="adv-dropdown__option"
+                            :class="{ 'is-selected': opt.value === advancedBackupEndHour }"
+                            @click="selectEndHour(opt.value)"
+                          >
+                            {{ opt.label }}
+                          </button>
+                        </div>
+                      </teleport>
                     </Transition>
                   </div>
                 </div>
@@ -2475,26 +2377,32 @@ watch(protocolDropdownOpen, (open) => {
                 <label class="advanced-field__label">每日备份次数</label>
                 <div class="adv-dropdown" @click.stop>
                   <button
+                    ref="countTriggerRef"
                     class="adv-dropdown__trigger"
                     :class="{ 'is-open': countDropdownOpen }"
-                    @click="countDropdownOpen = !countDropdownOpen; startHourDropdownOpen = false; endHourDropdownOpen = false"
+                    @click="toggleCountDropdown"
                   >
                     <span>{{ advancedBackupCount }} 次</span>
                     <ph-caret-down class="adv-dropdown__caret" />
                   </button>
                   <Transition name="dropdown">
-                    <div v-if="countDropdownOpen" class="adv-dropdown__menu">
-                      <button
-                        v-for="opt in backupCountOptions"
-                        :key="opt.value"
-                        class="adv-dropdown__option"
-                        :class="{ 'is-selected': opt.value === advancedBackupCount }"
-                        @click="selectBackupCount(opt.value)"
+                    <teleport to="body">
+                      <div
+                        v-if="countDropdownOpen"
+                        class="adv-dropdown__menu"
+                        :style="countDropdownStyle"
                       >
-                        {{ opt.label }}
-                        <ph-check v-if="opt.value === advancedBackupCount" class="adv-dropdown__check" />
-                      </button>
-                    </div>
+                        <button
+                          v-for="opt in backupCountOptions"
+                          :key="opt.value"
+                          class="adv-dropdown__option"
+                          :class="{ 'is-selected': opt.value === advancedBackupCount }"
+                          @click="selectBackupCount(opt.value)"
+                        >
+                          {{ opt.label }}
+                        </button>
+                      </div>
+                    </teleport>
                   </Transition>
                 </div>
               </div>
@@ -2687,9 +2595,9 @@ watch(protocolDropdownOpen, (open) => {
 }
 
 .panel__logo {
-  width: 32px;
-  height: 32px;
-  border-radius: 9px;
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
   background: linear-gradient(135deg, var(--accent) 0%, #ff8a6a 100%);
   display: grid;
   place-items: center;
@@ -2708,7 +2616,9 @@ watch(protocolDropdownOpen, (open) => {
 }
 
 .panel__logo-icon {
-  font-size: 16px;
+  font-size: 22px;
+  width: 22px;
+  height: 22px;
   color: white;
 }
 
@@ -3366,8 +3276,13 @@ select.input optgroup {
   padding: 6px;
   z-index: 999999;
   backdrop-filter: blur(12px);
-  max-height: 260px;
-  overflow: auto;
+  max-height: 150px;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.select-menu::-webkit-scrollbar {
+  display: none;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -3377,7 +3292,14 @@ select.input optgroup {
 }
 
 .select-menu--protocol {
-  max-height: 120px;
+  /* match advanced settings style */
+  max-height: 150px;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.select-menu::-webkit-scrollbar {
+  display: none;
 }
 
 /* URL 输入组 */
@@ -3478,30 +3400,31 @@ select.input optgroup {
 }
 
 .select-option {
-  width: 100%;
+  width: calc(100% - 8px);
+  margin: 2px 4px;
   border: 1px solid transparent;
   background: transparent;
   color: var(--ink);
-  padding: 10px 12px;
-  border-radius: 9px;
+  padding: 6px 8px;
+  border-radius: 6px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
   font-size: 13px;
   cursor: pointer;
-  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease, transform 0.1s ease;
+  transition: all 0.15s ease;
 }
 
 .select-option:hover {
-  background: var(--accent-soft);
+  background: rgba(125, 125, 125, 0.1);
 }
 
 .select-option.is-active {
-  border-color: var(--accent);
-  background: var(--accent-soft);
+  border-color: transparent;
+  background: rgba(255, 138, 106, 0.12);
   color: var(--accent);
-  box-shadow: 0 4px 12px rgba(232, 93, 59, 0.18);
+  box-shadow: none;
+  font-weight: 600;
 }
 
 .select-option__check {
@@ -4142,6 +4065,38 @@ select.input optgroup {
   color: var(--ink-muted);
 }
 
+.panel__info-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--ink-muted);
+  line-height: 1;
+}
+
+.panel__stat-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 1;
+}
+
+.panel__stat-icon {
+  width: 14px;
+  height: 14px;
+  font-size: 14px;
+  opacity: 0.9;
+  color: var(--accent);
+  margin-bottom: 0;
+  flex-shrink: 0;
+}
+
+.panel__subtitle {
+  margin: 0;
+  opacity: 0.8;
+}
+
 /* Modal 动画 */
 .modal-enter-active,
 .modal-leave-active {
@@ -4482,8 +4437,8 @@ select.input optgroup {
 .toggle {
   position: relative;
   display: inline-block;
-  width: 36px;
-  height: 20px;
+  width: 44px;
+  height: 24px;
 }
 
 .toggle--disabled {
@@ -4504,7 +4459,7 @@ select.input optgroup {
   /* Light mode default (darker for visibility) */
   background: #cbd5e1;
   border: 1px solid #94a3b8;
-  border-radius: 4px;
+  border-radius: 12px;
   cursor: pointer;
   transition: all 0.25s ease;
 }
@@ -4523,12 +4478,12 @@ select.input optgroup {
 .toggle__slider::before {
   content: '';
   position: absolute;
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
   left: 2px;
   bottom: 2px;
+  border-radius: 50%;
   background: white;
-  border-radius: 2px;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
   transition: transform 0.25s cubic-bezier(0.4, 0.0, 0.2, 1);
 }
@@ -4539,7 +4494,7 @@ select.input optgroup {
 }
 
 .toggle__input:checked + .toggle__slider::before {
-  transform: translateX(16px);
+  transform: translateX(20px);
 }
 
 /* Provider 徽章 */
@@ -4607,15 +4562,12 @@ select.input optgroup {
   align-items: center;
   justify-content: space-between;
   gap: 6px;
-  min-width: 80px;
-  padding: 2px 8px;
-  border-radius: 4px; /* Square style */
-  border-radius: 4px; /* Square style */
-  /* Light mode: solid border/bg for visibility */
-  border: 1px solid #cbd5e1;
-  background: white;
-  font-size: 12px;
-  height: 24px; /* Match similar height to toggle */
+  min-width: 100px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--input-border);
+  background: var(--input-bg);
+  font-size: 13px;
   font-weight: 500;
   color: var(--ink);
   cursor: pointer;
@@ -4624,7 +4576,7 @@ select.input optgroup {
 
 .adv-dropdown__trigger:hover {
   border-color: var(--accent);
-  background: rgba(232, 93, 59, 0.05);
+  box-shadow: 0 0 0 3px rgba(232, 93, 59, 0.12);
 }
 
 .adv-dropdown__trigger.is-open {
@@ -4632,12 +4584,7 @@ select.input optgroup {
   box-shadow: 0 0 0 3px rgba(232, 93, 59, 0.12);
 }
 
-@media (prefers-color-scheme: dark) {
-  .adv-dropdown__trigger {
-    background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.08); /* Revert to subtle border in dark mode */
-  }
-}
+/* Remove separate dark mode override as variables should handle it */
 
 .adv-dropdown__caret {
   font-size: 12px;
@@ -4652,8 +4599,10 @@ select.input optgroup {
 .adv-dropdown__menu {
   position: absolute;
   top: calc(100% + 6px);
-  left: 0;
+  right: 0;
   min-width: 100%;
+  width: max-content;
+  max-width: 240px;
   background: var(--card);
   border: 1px solid var(--card-border);
   border-radius: 6px;
@@ -4663,37 +4612,41 @@ select.input optgroup {
 }
 
 .adv-dropdown__menu--scroll {
-  max-height: 200px;
+  max-height: 120px;
   overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.adv-dropdown__menu--scroll::-webkit-scrollbar {
+  display: none;
 }
 
 .adv-dropdown__option {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  width: 100%;
-  padding: 6px 10px;
+  width: calc(100% - 8px);
+  margin: 2px 4px;
+  padding: 6px 8px;
   border: none;
   background: transparent;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--ink);
   cursor: pointer;
-  transition: background 0.15s ease;
+  transition: all 0.15s ease;
   text-align: left;
+  white-space: nowrap;
+  border-radius: 6px;
 }
 
 .adv-dropdown__option:hover {
-  background: var(--accent-soft);
+  background: rgba(125, 125, 125, 0.1);
 }
 
 .adv-dropdown__option.is-selected {
+  background: rgba(255, 138, 106, 0.12);
   color: var(--accent);
   font-weight: 600;
-}
-
-.adv-dropdown__check {
-  font-size: 14px;
-  color: var(--accent);
 }
 
 /* 下拉菜单动画 */
@@ -4784,11 +4737,14 @@ select.input optgroup {
 }
 .btn--compact {
   flex: 1;
-  height: 28px;
-  border-radius: 4px; /* Default square theme radius */
-  font-size: 12px;
-  padding: 0 12px;
+  height: 36px; /* Match input height */
+  border-radius: 9px; /* Match input radius */
+  font-size: 13px;
+  padding: 0 16px;
   font-weight: 500;
+  display: flex; /* Ensure centering */
+  align-items: center;
+  justify-content: center;
 }
 
 .modal__footer-actions {
@@ -4852,6 +4808,7 @@ select.input optgroup {
 }
 
 /* Custom Tooltip */
+/* Custom Tooltip */
 .help-icon[data-tooltip]:hover::after {
   content: attr(data-tooltip);
   position: absolute;
@@ -4864,11 +4821,15 @@ select.input optgroup {
   border-radius: 6px;
   font-size: 12px;
   font-weight: 500;
-  white-space: nowrap;
+  white-space: normal;
+  width: max-content;
+  max-width: 200px;
+  text-align: center;
   pointer-events: none;
   z-index: 9999;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
   backdrop-filter: blur(4px);
+  line-height: 1.4;
 }
 
 .help-icon[data-tooltip]:hover::before {
