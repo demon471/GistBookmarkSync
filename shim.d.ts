@@ -4,7 +4,7 @@ declare module 'webext-bridge' {
   export interface ProtocolMap {
     // define message protocol types
     // see https://github.com/antfu/webext-bridge#type-safe-protocols
-    'tab-prev': { title: string | undefined }
+    'tab-prev': { title?: string }
     'get-current-tab': ProtocolWithReturn<{ tabId: number }, { title?: string }>
     'validate-gist-auth': ProtocolWithReturn<
       { token: string, gistId: string, fileName: string, autoCreate?: boolean, createIfMissing?: boolean },
@@ -15,6 +15,6 @@ declare module 'webext-bridge' {
     'sync-upload': ProtocolWithReturn<undefined, { ok: boolean, summary?: string, timestamp?: string, error?: string }>
     'sync-download': ProtocolWithReturn<undefined, { ok: boolean, summary?: string, timestamp?: string, error?: string }>
     'open-sidepanel': ProtocolWithReturn<undefined, { ok: boolean, error?: string }>
-    'close-sidepanel': ProtocolWithReturn<undefined, void>
+    'close-sidepanel': ProtocolWithReturn<{ tabId?: number } | undefined, void>
   }
 }

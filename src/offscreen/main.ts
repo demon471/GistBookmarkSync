@@ -1,4 +1,5 @@
 /* eslint-disable no-console */
+declare const chrome: any
 
 const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
 

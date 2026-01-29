@@ -19,7 +19,7 @@ export interface SyncLogEntry {
   id: string
   time: string
   provider: 'gist' | 'webdav'
-  mode: 'upload' | 'download' | 'random-backup' | 'concurrent-sync'
+  mode: 'upload' | 'download' | 'random-backup' | 'concurrent-sync' | 'scheduled-upload' | 'scheduled-download'
   status: 'ok' | 'error'
   summary: string
 }

@@ -1,5 +1,5 @@
 import { onMessage, sendMessage } from 'webext-bridge/background'
-import type { Tabs } from 'webextension-polyfill'
+import type { Tabs, Bookmarks } from 'webextension-polyfill'
 import { compressData, decompressData } from '~/logic/compression'
 
 // only on dev mode
@@ -17,7 +17,7 @@ browser.runtime.onInstalled.addListener((): void => {
   if (USE_SIDE_PANEL) {
     // @ts-expect-error missing types
     browser.sidePanel
-      .setPanelBehavior({ openPanelOnActionClick: false })
+      .setPanelBehavior({ openPanelOnActionClick: true })
       .catch((error: unknown) => console.error(error))
   }
   // eslint-disable-next-line no-console
@@ -152,7 +152,7 @@ interface SyncLogEntry {
   id: string
   time: string
   provider: 'gist' | 'webdav'
-  mode: 'upload' | 'download' | 'random-backup' | 'concurrent-sync'
+  mode: 'upload' | 'download' | 'random-backup' | 'concurrent-sync' | 'scheduled-upload' | 'scheduled-download'
   status: 'ok' | 'error'
   summary: string
 }
@@ -231,7 +231,7 @@ async function appendSyncLog(entry: SyncLogEntry) {
 
 async function finalizeSyncResult(
   provider: 'gist' | 'webdav',
-  mode: 'upload' | 'download',
+  mode: SyncLogEntry['mode'],
   result: { ok: true, summary?: string, timestamp?: string } | { ok: false, error?: string },
 ) {
   const entry: SyncLogEntry = {
@@ -1158,25 +1158,41 @@ if (browser.alarms) {
       const webdavUrl = (stored['webdav-url'] as string | undefined)?.trim()
 
       if (provider === 'webdav') {
-        if (!webdavUrl)
+        if (!webdavUrl) {
+          await logAutoSyncSkip('webdav', 'Missing WebDAV URL')
           return
+        }
         debugLog('Auto sync: WebDAV download trigger')
       }
       else if (provider === 'gist') {
-        if (!token || !gistId || !fileName)
+        if (!token || !gistId || !fileName) {
+          await logAutoSyncSkip('gist', 'Missing Gist Config')
           return
+        }
         debugLog('Auto sync: Gist download trigger')
       }
       else {
         return
       }
 
-      await performSync('download')
+      await performSync('download', 'scheduled-download')
     }
     catch {
       // ignore
     }
   })
+}
+
+async function logAutoSyncSkip(provider: 'gist' | 'webdav', reason: string) {
+  const entry: SyncLogEntry = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    time: new Date().toISOString(),
+    provider,
+    mode: 'scheduled-download',
+    status: 'error',
+    summary: `定时拉取跳过: ${reason}`,
+  }
+  await appendSyncLog(entry)
 }
 
 browser.storage.onChanged.addListener((changes, areaName) => {
@@ -1202,7 +1218,7 @@ browser.storage.onChanged.addListener((changes, areaName) => {
 })
 
 onMessage('refresh-sync-interval', async ({ data }) => {
-  let minutes = Number(data?.minutes)
+  let minutes = Number((data as { minutes?: number })?.minutes)
   if (!Number.isFinite(minutes)) {
     const stored = await browser.storage.local.get(['sync-interval-minutes'])
     minutes = Number(stored['sync-interval-minutes'] || 0)
@@ -1211,7 +1227,7 @@ onMessage('refresh-sync-interval', async ({ data }) => {
   return { ok: true }
 })
 
-async function buildLocalIndex(root: browser.bookmarks.BookmarkTreeNode) {
+async function buildLocalIndex(root: Bookmarks.BookmarkTreeNode) {
   const index = new Map<string, LocalFolderInfo>()
   const rootPath = ''
 
@@ -1225,7 +1241,7 @@ async function buildLocalIndex(root: browser.bookmarks.BookmarkTreeNode) {
     }
   }
 
-  function walk(node: browser.bookmarks.BookmarkTreeNode, currentPath: string) {
+  function walk(node: Bookmarks.BookmarkTreeNode, currentPath: string) {
     if (node.url) {
       const folder = index.get(currentPath)
       folder?.bookmarkUrls.add(node.url)
@@ -1297,11 +1313,11 @@ async function ensureLocalEntries(rootId: string, index: Map<string, LocalFolder
   await walk(nodes, '', rootId)
 }
 
-async function clearLocalBookmarks(root: browser.bookmarks.BookmarkTreeNode, protectedIds?: Set<string>) {
+async function clearLocalBookmarks(root: Bookmarks.BookmarkTreeNode, protectedIds?: Set<string>) {
   // eslint-disable-next-line no-console
   console.log('[ClearBookmarks] Clearing bookmarks', { protectedCount: protectedIds?.size })
 
-  async function removeAllChildren(node: browser.bookmarks.BookmarkTreeNode) {
+  async function removeAllChildren(node: Bookmarks.BookmarkTreeNode) {
     if (!node.children) return
     for (const child of node.children) {
       // 如果节点被保护（排除在同步之外），则跳过（不删除也不递归删除其子节点）
@@ -1396,7 +1412,7 @@ onMessage('validate-gist-auth', async ({ data }) => {
           'Accept': 'application/vnd.github+json',
           'Authorization': `token ${token}`,
           'X-GitHub-Api-Version': '2022-11-28',
-        },
+        } as HeadersInit,
       },
       {
         description: 'GistBookmarkSync',
@@ -1438,7 +1454,7 @@ onMessage('validate-gist-auth', async ({ data }) => {
       'Accept': 'application/vnd.github+json',
       'Authorization': `token ${token}`,
       'X-GitHub-Api-Version': '2022-11-28',
-    },
+    } as HeadersInit,
   })
 
   if (response.status === 401)
@@ -1468,7 +1484,7 @@ onMessage('validate-gist-auth', async ({ data }) => {
           'Accept': 'application/vnd.github+json',
           'Authorization': `token ${token}`,
           'X-GitHub-Api-Version': '2022-11-28',
-        },
+        } as HeadersInit,
       },
       {
         files: {
@@ -1512,10 +1528,10 @@ onMessage('validate-gist-auth', async ({ data }) => {
 })
 
 onMessage('validate-webdav-auth', async ({ data }) => {
-  const baseUrl = data?.url?.trim()
+  const baseUrl = (data as { url?: string })?.url?.trim() || ''
   const rawFilePath = ''
-  const username = data?.username as string | undefined
-  const password = data?.password as string | undefined
+  const username = (data as { username?: string })?.username
+  const password = (data as { password?: string })?.password
   const errors: string[] = []
 
   if (!baseUrl)
@@ -1527,24 +1543,24 @@ onMessage('validate-webdav-auth', async ({ data }) => {
   const filePath = resolveWebDavFilePath(rawFilePath)
 
   if (filePath) {
-    const ensureResult = await ensureWebDavDirectories(baseUrl, filePath, username, password)
+    const ensureResult = await ensureWebDavDirectories(baseUrl, filePath || '', username || '', password || '')
     if (!ensureResult.ok)
       return { ok: false, errors: [ensureResult.error || 'WebDAV 目录校验失败'] }
   }
 
   const versionsIndexPath = buildWebDavVersionsIndexPath()
-  const versionsEnsure = await ensureWebDavDirectories(baseUrl, versionsIndexPath, username, password)
+  const versionsEnsure = await ensureWebDavDirectories(baseUrl, versionsIndexPath, username || '', password || '')
   if (!versionsEnsure.ok)
     return { ok: false, errors: [versionsEnsure.error || 'WebDAV 版本目录校验失败'] }
 
-  const fileUrl = buildWebDavFileUrl(baseUrl, filePath)
+  const fileUrl = buildWebDavFileUrl(baseUrl, filePath || '')
 
   try {
     const response = await fetch(fileUrl, {
       method: 'GET',
       headers: {
         ...buildWebDavAuthHeaders(username, password),
-      },
+      } as HeadersInit,
     })
 
     if (response.status === 401 || response.status === 403)
@@ -1582,7 +1598,8 @@ onMessage('get-bookmark-folders', async () => {
   }
 })
 
-async function performSync(mode: 'upload' | 'download') {
+async function performSync(mode: 'upload' | 'download', explicitLogMode?: SyncLogEntry['mode']) {
+  const logMode = explicitLogMode || mode
   let provider: 'gist' | 'webdav' = 'gist'
   try {
     const stored = await browser.storage.local.get([
@@ -1598,7 +1615,7 @@ async function performSync(mode: 'upload' | 'download') {
       'webdav-password',
       'advanced-concurrent-sync',
     ])
-    provider = (stored['sync-provider'] as string | undefined) || 'gist'
+    provider = (stored['sync-provider'] as 'gist' | 'webdav' | undefined) || 'gist'
     const token = (stored['github-token'] as string | undefined)?.trim()
     const gistId = (stored['gist-id'] as string | undefined)?.trim()
     const fileName = (stored['gist-file-name'] as string | undefined)?.trim()
@@ -1620,7 +1637,7 @@ async function performSync(mode: 'upload' | 'download') {
           'webdav-connection-status': 'error',
           'webdav-last-validation-time': Date.now(),
         })
-        return await finalizeSyncResult(provider, mode, {
+        return await finalizeSyncResult(provider, logMode, {
           ok: false,
           error: '请先配置 WebDAV 地址',
         })
@@ -1631,7 +1648,7 @@ async function performSync(mode: 'upload' | 'download') {
 
       const localResult = await loadLocalNodes() // No args
       if (!localResult.ok)
-        return await finalizeSyncResult(provider, mode, { ok: false, error: localResult.error })
+        return await finalizeSyncResult(provider, logMode, { ok: false, error: localResult.error })
 
       const { root, localNodes } = localResult
 
@@ -1642,7 +1659,7 @@ async function performSync(mode: 'upload' | 'download') {
             'webdav-connection-status': 'error',
             'webdav-last-validation-time': Date.now(),
           })
-          return await finalizeSyncResult(provider, mode, { ok: false, error: ensureResult.error })
+          return await finalizeSyncResult(provider, logMode, { ok: false, error: ensureResult.error })
         }
 
         let existingText: string | null = null
@@ -1651,14 +1668,14 @@ async function performSync(mode: 'upload' | 'download') {
             method: 'GET',
             headers: {
               ...buildWebDavAuthHeaders(username, password),
-            },
+            } as HeadersInit,
           })
           if (existingResponse.status === 401 || existingResponse.status === 403) {
             await browser.storage.local.set({
               'webdav-connection-status': 'error',
               'webdav-last-validation-time': Date.now(),
             })
-            return await finalizeSyncResult(provider, mode, { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' })
+            return await finalizeSyncResult(provider, logMode, { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' })
           }
           else if (existingResponse.status !== 404 && existingResponse.ok) {
             existingText = await existingResponse.text()
@@ -1668,7 +1685,7 @@ async function performSync(mode: 'upload' | 'download') {
               'webdav-connection-status': 'error',
               'webdav-last-validation-time': Date.now(),
             })
-            return await finalizeSyncResult(provider, mode, { ok: false, error: 'WebDAV 读取失败，请检查地址配置' })
+            return await finalizeSyncResult(provider, logMode, { ok: false, error: 'WebDAV 读取失败，请检查地址配置' })
           }
         }
         catch {
@@ -1676,7 +1693,7 @@ async function performSync(mode: 'upload' | 'download') {
             'webdav-connection-status': 'error',
             'webdav-last-validation-time': Date.now(),
           })
-          return await finalizeSyncResult(provider, mode, { ok: false, error: 'WebDAV 读取失败，请检查地址配置' })
+          return await finalizeSyncResult(provider, logMode, { ok: false, error: 'WebDAV 读取失败，请检查地址配置' })
         }
 
         let remoteJson = ''
@@ -1712,7 +1729,7 @@ async function performSync(mode: 'upload' | 'download') {
             void performRandomBackup({ isConcurrent: true })
           }
 
-          return await finalizeSyncResult(provider, mode, {
+          return await finalizeSyncResult(provider, logMode, {
             ok: true,
             summary: '无变更，已跳过上传',
             timestamp,
@@ -1725,7 +1742,7 @@ async function performSync(mode: 'upload' | 'download') {
             'webdav-connection-status': 'error',
             'webdav-last-validation-time': Date.now(),
           })
-          return await finalizeSyncResult(provider, mode, { ok: false, error: updated.error })
+          return await finalizeSyncResult(provider, logMode, { ok: false, error: updated.error })
         }
 
         const localCount = countBookmarks(localNodes)
@@ -1735,7 +1752,7 @@ async function performSync(mode: 'upload' | 'download') {
             'webdav-connection-status': 'error',
             'webdav-last-validation-time': Date.now(),
           })
-          return await finalizeSyncResult(provider, mode, { ok: false, error: versionResult.error })
+          return await finalizeSyncResult(provider, logMode, { ok: false, error: versionResult.error })
         }
         const summary = `成功同步 ${localCount} 条书签`
         const timestamp = new Date().toISOString()
@@ -1752,7 +1769,7 @@ async function performSync(mode: 'upload' | 'download') {
           void performRandomBackup({ isConcurrent: true })
         }
 
-        return await finalizeSyncResult(provider, mode, {
+        return await finalizeSyncResult(provider, logMode, {
           ok: true,
           summary,
           timestamp,
@@ -1765,7 +1782,7 @@ async function performSync(mode: 'upload' | 'download') {
           'webdav-connection-status': 'error',
           'webdav-last-validation-time': Date.now(),
         })
-        return await finalizeSyncResult(provider, mode, { ok: false, error: webdavResult.error })
+        return await finalizeSyncResult(provider, logMode, { ok: false, error: webdavResult.error })
       }
 
       await browser.storage.local.set({
@@ -1775,8 +1792,8 @@ async function performSync(mode: 'upload' | 'download') {
 
       bookmarkEventSuspension += 1
       try {
-        const downloadResult = await applyWebDavDownload(webdavResult.nodes, root, localNodes, selectedFolderIds)
-        return await finalizeSyncResult(provider, mode, downloadResult)
+        const downloadResult = await applyWebDavDownload(webdavResult.nodes, root, localNodes)
+        return await finalizeSyncResult(provider, logMode, downloadResult)
       }
       finally {
         bookmarkEventSuspension = Math.max(0, bookmarkEventSuspension - 1)
@@ -1789,7 +1806,7 @@ async function performSync(mode: 'upload' | 'download') {
         'connection-status': 'error',
         'last-validation-time': Date.now(),
       })
-      return await finalizeSyncResult(provider, mode, {
+      return await finalizeSyncResult(provider, logMode, {
         ok: false,
         error: '请先配置 GitHub Token、Gist ID 和文件名',
       })
@@ -1802,7 +1819,7 @@ async function performSync(mode: 'upload' | 'download') {
         'connection-status': 'error',
         'last-validation-time': Date.now(),
       })
-      return await finalizeSyncResult(provider, mode, { ok: false, error: gistResult.error })
+      return await finalizeSyncResult(provider, logMode, { ok: false, error: gistResult.error })
     }
 
     // 连接成功，更新状态
@@ -1814,7 +1831,7 @@ async function performSync(mode: 'upload' | 'download') {
     // 始终加载所有本地书签
     const localResult = await loadLocalNodes()
     if (!localResult.ok)
-      return await finalizeSyncResult(provider, mode, { ok: false, error: localResult.error })
+      return await finalizeSyncResult(provider, logMode, { ok: false, error: localResult.error })
 
     const { root, localNodes } = localResult
 
@@ -1822,7 +1839,7 @@ async function performSync(mode: 'upload' | 'download') {
     if (mode === 'upload') {
       const updated = await updateGistFile(token, gistId, fileName, localNodes)
       if (!updated)
-        return await finalizeSyncResult(provider, mode, { ok: false, error: 'Failed to update Gist' })
+        return await finalizeSyncResult(provider, logMode, { ok: false, error: 'Failed to update Gist' })
 
       const localCount = countBookmarks(localNodes)
       const summary = `成功同步 ${localCount} 条书签`
@@ -1841,7 +1858,7 @@ async function performSync(mode: 'upload' | 'download') {
         void performRandomBackup({ isConcurrent: true })
       }
 
-      return await finalizeSyncResult(provider, mode, {
+      return await finalizeSyncResult(provider, logMode, {
         ok: true,
         summary,
         timestamp,
@@ -1875,7 +1892,7 @@ async function performSync(mode: 'upload' | 'download') {
         'gist-last-sync-strategy': conflictStrategy,
       })
 
-      return await finalizeSyncResult(provider, mode, {
+      return await finalizeSyncResult(provider, logMode, {
         ok: true,
         summary,
         timestamp,
@@ -1887,7 +1904,7 @@ async function performSync(mode: 'upload' | 'download') {
   }
   catch (error) {
     const message = error instanceof Error ? error.message : '同步失败'
-    return await finalizeSyncResult(provider, mode, { ok: false, error: message })
+    return await finalizeSyncResult(provider, logMode, { ok: false, error: message })
   }
 }
 
@@ -2164,7 +2181,7 @@ async function scheduleNextRandomBackup(force = false) {
   ])
 
   const enabled = stored['advanced-backup-enabled'] === true
-  const backupProvider = stored['advanced-backup-provider'] as string | undefined
+
 
   if (!enabled) {
     debugLog('Random backup scheduling skipped: feature not enabled')
@@ -2172,11 +2189,9 @@ async function scheduleNextRandomBackup(force = false) {
     return
   }
 
-  if (!backupProvider) {
-    debugLog('Random backup scheduling skipped: no backup provider selected')
-    await browser.alarms?.clear(RANDOM_BACKUP_ALARM_NAME)
-    return
-  }
+  // 动态确定备份 provider，不依赖 stored['advanced-backup-provider']
+  const mainProvider = (stored['sync-provider'] as string | undefined) || 'gist'
+  const backupProvider = mainProvider === 'gist' ? 'webdav' : 'gist'
 
   const startHour = (stored['advanced-backup-start-hour'] as number | undefined) ?? 9
   const endHour = (stored['advanced-backup-end-hour'] as number | undefined) ?? 18
@@ -2421,7 +2436,7 @@ onMessage('webdav-list-versions', async () => {
 })
 
 onMessage('webdav-delete-version', async ({ data }) => {
-  const file = data?.file as string | undefined
+  const file = (data as { file?: string })?.file
   if (!file)
     return { ok: false, error: '缺少版本文件' }
 
@@ -2443,7 +2458,7 @@ onMessage('webdav-delete-version', async ({ data }) => {
     method: 'DELETE',
     headers: {
       ...buildWebDavAuthHeaders(username, password),
-    },
+    } as HeadersInit,
   })
 
   if (response.status === 401 || response.status === 403)
@@ -2455,7 +2470,7 @@ onMessage('webdav-delete-version', async ({ data }) => {
   if (!indexResult.ok)
     return { ok: false, error: indexResult.error }
 
-  const nextEntries = indexResult.entries.filter(entry => entry.file !== file)
+  const nextEntries = (indexResult.entries || []).filter(entry => entry.file !== file)
   const saveResult = await saveWebDavVersionsIndex(baseUrl, username, password, nextEntries)
   if (!saveResult.ok)
     return { ok: false, error: saveResult.error }
@@ -2464,7 +2479,7 @@ onMessage('webdav-delete-version', async ({ data }) => {
 })
 
 onMessage('webdav-download-version', async ({ data }) => {
-  const file = data?.file as string | undefined
+  const file = (data as { file?: string })?.file
   if (!file)
     return { ok: false, error: '缺少版本文件' }
 
@@ -2547,7 +2562,7 @@ async function toggleSidePanel(tabId: number) {
 
 onMessage('open-sidepanel', async ({ sender }) => {
   try {
-    const tabId = sender?.tabId ?? sender?.tab?.id
+    const tabId = sender?.tabId ?? (sender as any)?.tab?.id
     if (!tabId)
       return { ok: false, error: 'No tab id from sender' }
 
@@ -2560,13 +2575,12 @@ onMessage('open-sidepanel', async ({ sender }) => {
   }
 })
 
-// Support toggling via toolbar icon
-// Note: This requires openPanelOnActionClick to be false
-browser.action.onClicked.addListener(async (tab) => {
-  if (tab.id) {
-    await toggleSidePanel(tab.id)
-  }
-})
+// Support toggling via toolbar icon -> Reverted to native behavior
+// browser.action.onClicked.addListener(async (tab) => {
+//   if (tab.id) {
+//     await toggleSidePanel(tab.id)
+//   }
+// })
 
 async function shouldTriggerAutoSync(nodeId?: string, parentId?: string, oldParentId?: string) {
   if (bookmarkEventSuspension > 0)
@@ -2611,7 +2625,7 @@ browser.bookmarks.onRemoved.addListener(async (_id, removeInfo) => {
 })
 
 onMessage('sidepanel-visibility', ({ sender, data }) => {
-  const tabId = (data as { tabId?: number } | undefined)?.tabId ?? sender?.tabId ?? sender?.tab?.id
+  const tabId = (data as { tabId?: number } | undefined)?.tabId ?? sender?.tabId ?? (sender as any)?.tab?.id
   if (!tabId)
     return { ok: false, error: 'No tab id from sender' }
 
@@ -2638,7 +2652,7 @@ onMessage('clear-bookmarks', async () => {
     // Validate if selected IDs match current tree
     if (selectedIds.size > 0) {
       let matchFound = false
-      const checkMatch = (node: browser.bookmarks.BookmarkTreeNode) => {
+      const checkMatch = (node: Bookmarks.BookmarkTreeNode) => {
         if (matchFound)
           return
         if (selectedIds.has(node.id)) {
@@ -2696,7 +2710,7 @@ onMessage('export-bookmarks', async ({ data }) => {
 
 onMessage('import-bookmarks', async ({ data }) => {
   try {
-    const bookmarks = data?.bookmarks as SyncNode[] | undefined
+    const bookmarks = (data as { bookmarks?: SyncNode[] })?.bookmarks
     if (!Array.isArray(bookmarks))
       return { ok: false, error: '无效的书签数据' }
 
@@ -2720,7 +2734,7 @@ onMessage('get-bookmark-stats', async () => {
   const tree = await browser.bookmarks.getTree()
   let bookmarks = 0
   let folders = 0
-  const walk = (nodes: browser.bookmarks.BookmarkTreeNode[]) => {
+  const walk = (nodes: Bookmarks.BookmarkTreeNode[]) => {
     for (const node of nodes) {
       if (node.url) {
         bookmarks++
@@ -2757,7 +2771,7 @@ async function moveExcludedToEnd(protectedIds: Set<string>) {
 
   // 遍历寻找需要移动的 ID
   const tree = await browser.bookmarks.getTree()
-  const walk = (node: browser.bookmarks.BookmarkTreeNode) => {
+  const walk = (node: Bookmarks.BookmarkTreeNode) => {
     if (protectedIds.has(node.id)) {
       toMove.push(node.id)
       return

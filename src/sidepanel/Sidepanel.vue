@@ -1296,6 +1296,8 @@ const isAlternateProviderConfigured = computed(() => {
   }
 })
 
+
+
 /**
  * 打开高级设置弹窗
  */
@@ -1429,8 +1431,8 @@ const backupCountOptions = [
   { value: 1, label: '1 次' },
   { value: 2, label: '2 次' },
   { value: 3, label: '3 次' },
+  { value: 4, label: '4 次' },
   { value: 5, label: '5 次' },
-  { value: 10, label: '10 次' },
 ]
 
 // Advanced Dropdown Refs & Styles
@@ -2121,7 +2123,7 @@ watch(protocolDropdownOpen, (open) => {
                   </div>
                 </div>
                 <div class="sync-log-meta">
-                  <span class="sync-log-badge" :data-mode="item.mode">{{ item.mode === 'upload' ? '推送' : item.mode === 'download' ? '拉取' : item.mode === 'concurrent-sync' ? '随行' : '随机' }}</span>
+                  <span class="sync-log-badge" :data-mode="item.mode">{{ item.mode === 'upload' ? '推送' : item.mode === 'download' ? '拉取' : item.mode === 'concurrent-sync' ? '随行' : (item.mode === 'scheduled-download' || item.mode === 'scheduled-upload') ? '定时' : '随机' }}</span>
                   <span class="sync-log-time">
                     {{ formatSyncLogTime(item.time) }}
                   </span>
@@ -3111,6 +3113,13 @@ watch(protocolDropdownOpen, (open) => {
   color: #06b6d4;
   border-color: rgba(6, 182, 212, 0.4);
   background: rgba(6, 182, 212, 0.12);
+}
+
+.sync-log-badge[data-mode="scheduled-download"],
+.sync-log-badge[data-mode="scheduled-upload"] {
+  color: #f59e0b;
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.12);
 }
 
 .sync-log-time {
@@ -4937,5 +4946,6 @@ select.input optgroup {
     color: rgba(255, 255, 255, 0.6);
   }
 }
+
 </style>
 
