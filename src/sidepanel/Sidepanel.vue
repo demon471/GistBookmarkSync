@@ -974,16 +974,17 @@ function importConfig() {
     }
     try {
       const text = await file.text()
-      const config = JSON.parse(text)
+      const config = JSON.parse(text) as Record<string, unknown>
+      const hasKey = (key: string) => Object.prototype.hasOwnProperty.call(config, key)
       if (config.syncProvider === 'webdav' || config.syncProvider === 'gist')
         syncProvider.value = config.syncProvider
-      if (config.githubToken)
+      if (hasKey('githubToken') && typeof config.githubToken === 'string')
         githubToken.value = config.githubToken
-      if (config.gistId)
+      if (hasKey('gistId') && typeof config.gistId === 'string')
         gistId.value = config.gistId
-      if (config.gistFileName)
+      if (hasKey('gistFileName') && typeof config.gistFileName === 'string')
         gistFileName.value = config.gistFileName
-      if (config.webdavUrl)
+      if (hasKey('webdavUrl') && typeof config.webdavUrl === 'string')
         webdavUrl.value = normalizeWebdavUrl(config.webdavUrl, webdavProtocol.value)
       if (config.webdavProtocol === 'http' || config.webdavProtocol === 'https') {
         webdavProtocol.value = config.webdavProtocol
@@ -991,16 +992,16 @@ function importConfig() {
         if (host)
           webdavUrl.value = normalizeWebdavUrl(host, webdavProtocol.value)
       }
-      if (config.webdavUsername)
+      if (hasKey('webdavUsername') && typeof config.webdavUsername === 'string')
         webdavUsername.value = config.webdavUsername
-      if (config.webdavPassword)
+      if (hasKey('webdavPassword') && typeof config.webdavPassword === 'string')
         webdavPassword.value = config.webdavPassword
       if (typeof config.syncIntervalMinutes === 'number')
         syncIntervalMinutes.value = config.syncIntervalMinutes
 
       if (typeof config.advancedBackupEnabled === 'boolean')
         advancedBackupEnabled.value = config.advancedBackupEnabled
-      if (config.advancedBackupProvider === 'gist' || config.advancedBackupProvider === 'webdav')
+      if (config.advancedBackupProvider === 'gist' || config.advancedBackupProvider === 'webdav' || config.advancedBackupProvider === '')
         advancedBackupProvider.value = config.advancedBackupProvider
       if (typeof config.advancedBackupStartHour === 'number')
         advancedBackupStartHour.value = config.advancedBackupStartHour
@@ -1015,17 +1016,17 @@ function importConfig() {
       const storagePayload: Record<string, unknown> = {}
       if (config.syncProvider === 'webdav' || config.syncProvider === 'gist')
         storagePayload['sync-provider'] = config.syncProvider
-      if (config.githubToken)
+      if (hasKey('githubToken') && typeof config.githubToken === 'string')
         storagePayload['github-token'] = config.githubToken
-      if (config.gistId)
+      if (hasKey('gistId') && typeof config.gistId === 'string')
         storagePayload['gist-id'] = config.gistId
-      if (config.gistFileName)
+      if (hasKey('gistFileName') && typeof config.gistFileName === 'string')
         storagePayload['gist-file-name'] = config.gistFileName
-      if (config.webdavUrl)
+      if (hasKey('webdavUrl') && typeof config.webdavUrl === 'string')
         storagePayload['webdav-url'] = normalizeWebdavUrl(config.webdavUrl, webdavProtocol.value)
-      if (config.webdavUsername)
+      if (hasKey('webdavUsername') && typeof config.webdavUsername === 'string')
         storagePayload['webdav-username'] = config.webdavUsername
-      if (config.webdavPassword)
+      if (hasKey('webdavPassword') && typeof config.webdavPassword === 'string')
         storagePayload['webdav-password'] = config.webdavPassword
       if (typeof config.syncIntervalMinutes === 'number')
         storagePayload['sync-interval-minutes'] = config.syncIntervalMinutes
@@ -1034,7 +1035,7 @@ function importConfig() {
 
       if (typeof config.advancedBackupEnabled === 'boolean')
         storagePayload['advanced-backup-enabled'] = config.advancedBackupEnabled
-      if (config.advancedBackupProvider === 'gist' || config.advancedBackupProvider === 'webdav')
+      if (config.advancedBackupProvider === 'gist' || config.advancedBackupProvider === 'webdav' || config.advancedBackupProvider === '')
         storagePayload['advanced-backup-provider'] = config.advancedBackupProvider
       if (typeof config.advancedBackupStartHour === 'number')
         storagePayload['advanced-backup-start-hour'] = config.advancedBackupStartHour
@@ -4948,4 +4949,3 @@ select.input optgroup {
 }
 
 </style>
-

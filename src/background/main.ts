@@ -141,6 +141,10 @@ type WebDavLoadResult =
   | { ok: true, nodes: SyncNode[], raw: { browser?: string, version?: string | number, createDate?: number, bookmarks?: unknown[] } }
   | { ok: false, error: string }
 
+type WebDavRemoteContentHashResult =
+  | { ok: true, missing: boolean, contentHash?: string }
+  | { ok: false, error: string }
+
 interface WebDavVersionEntry {
   file: string
   timestamp: string
@@ -627,6 +631,56 @@ async function loadWebDavBookmarks(url: string, username?: string, password?: st
 
   const nodes = sanitizeNodes(parsed.bookmarks)
   return { ok: true, nodes, raw: parsed }
+}
+
+async function loadWebDavRemoteContentHash(url: string, username?: string, password?: string): Promise<WebDavRemoteContentHashResult> {
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        ...buildWebDavAuthHeaders(username, password),
+      },
+    })
+  }
+  catch {
+    return { ok: false, error: 'WebDAV 读取失败，请检查地址配置' }
+  }
+
+  if (response.status === 401 || response.status === 403)
+    return { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' }
+  if (response.status === 404)
+    return { ok: true, missing: true }
+  if (!response.ok)
+    return { ok: false, error: 'WebDAV 读取失败，请检查地址配置' }
+
+  let content = ''
+  try {
+    content = await readWebDavResponseText(response)
+  }
+  catch {
+    return { ok: false, error: 'WebDAV 文件读取失败' }
+  }
+
+  let parsed: { bookmarks?: unknown[] } | null = null
+  try {
+    parsed = await decompressData<{ bookmarks?: unknown[] }>(content)
+  }
+  catch {
+    debugLog('WebDAV 版本比对跳过：远端内容无法解析')
+    return { ok: true, missing: false }
+  }
+
+  if (!parsed || !Array.isArray(parsed.bookmarks))
+    return { ok: true, missing: false }
+
+  const remoteNodes = sanitizeNodes(parsed.bookmarks)
+  const contentHash = await computeContentHash(remoteNodes)
+  return {
+    ok: true,
+    missing: false,
+    contentHash,
+  }
 }
 
 async function applyWebDavDownload(
@@ -1662,68 +1716,28 @@ async function performSync(mode: 'upload' | 'download', explicitLogMode?: SyncLo
           return await finalizeSyncResult(provider, logMode, { ok: false, error: ensureResult.error })
         }
 
-        let existingText: string | null = null
-        try {
-          const existingResponse = await fetch(fileUrl, {
-            method: 'GET',
-            headers: {
-              ...buildWebDavAuthHeaders(username, password),
-            } as HeadersInit,
-          })
-          if (existingResponse.status === 401 || existingResponse.status === 403) {
-            await browser.storage.local.set({
-              'webdav-connection-status': 'error',
-              'webdav-last-validation-time': Date.now(),
-            })
-            return await finalizeSyncResult(provider, logMode, { ok: false, error: 'WebDAV 认证失败，请检查账号或密码' })
-          }
-          else if (existingResponse.status !== 404 && existingResponse.ok) {
-            existingText = await existingResponse.text()
-          }
-          else if (existingResponse.status !== 404 && !existingResponse.ok) {
-            await browser.storage.local.set({
-              'webdav-connection-status': 'error',
-              'webdav-last-validation-time': Date.now(),
-            })
-            return await finalizeSyncResult(provider, logMode, { ok: false, error: 'WebDAV 读取失败，请检查地址配置' })
-          }
-        }
-        catch {
+        const localContentHash = await computeContentHash(localNodes)
+        const remoteVersionResult = await loadWebDavRemoteContentHash(fileUrl, username, password)
+        if (!remoteVersionResult.ok) {
           await browser.storage.local.set({
             'webdav-connection-status': 'error',
             'webdav-last-validation-time': Date.now(),
           })
-          return await finalizeSyncResult(provider, logMode, { ok: false, error: 'WebDAV 读取失败，请检查地址配置' })
+          return await finalizeSyncResult(provider, logMode, { ok: false, error: remoteVersionResult.error })
         }
 
-        let remoteJson = ''
-        if (existingText) {
-          try {
-            // 尝试解压现有内容以进行比较
-            const parsed = await decompressData<any>(existingText)
-            if (parsed && parsed.bookmarks) {
-              remoteJson = JSON.stringify(parsed.bookmarks)
-            }
-          }
-          catch {
-            // ignore parse error which means content changed or corrupted
-          }
+        if (remoteVersionResult.missing) {
+          debugLog('WebDAV 远端版本不存在，直接上传')
         }
-
-        const localJson = JSON.stringify(localNodes)
-
-        // 生成压缩后的 Payload 用于版本快照
-        const fullPayload = buildBookmarkPayload(localNodes)
-        const payloadText = await compressData(fullPayload)
-
-        if (remoteJson && remoteJson === localJson) {
+        else if (remoteVersionResult.contentHash && remoteVersionResult.contentHash === localContentHash) {
           const timestamp = new Date().toISOString()
           await browser.storage.local.set({
             'webdav-connection-status': 'ok',
             'webdav-last-validation-time': Date.now(),
             'webdav-last-sync': timestamp,
-            'webdav-last-sync-summary': '无变更，已跳过上传',
+            'webdav-last-sync-summary': '版本一致，已跳过上传',
             'webdav-last-sync-folders': selectedFolderIds || [],
+            'backup-hash-webdav': localContentHash,
           })
           if (mode === 'upload' && concurrentSync) {
             void performRandomBackup({ isConcurrent: true })
@@ -1731,10 +1745,14 @@ async function performSync(mode: 'upload' | 'download', explicitLogMode?: SyncLo
 
           return await finalizeSyncResult(provider, logMode, {
             ok: true,
-            summary: '无变更，已跳过上传',
+            summary: '版本一致，已跳过上传',
             timestamp,
           })
         }
+
+        // 生成压缩后的 Payload 用于版本快照
+        const fullPayload = buildBookmarkPayload(localNodes)
+        const payloadText = await compressData(fullPayload)
 
         const updated = await updateWebDavFile(fileUrl, username, password, localNodes)
         if (!updated.ok) {
@@ -2009,6 +2027,24 @@ async function performRandomBackup(options: { isConcurrent?: boolean } = {}) {
 
       const filePath = resolveWebDavFilePath('')
       const fileUrl = buildWebDavFileUrl(baseUrl, filePath)
+
+      const remoteVersionResult = await loadWebDavRemoteContentHash(fileUrl, username, password)
+      if (!remoteVersionResult.ok) {
+        return await finalizeRandomBackupResult(provider, { ok: false, error: remoteVersionResult.error }, isConcurrent)
+      }
+      if (remoteVersionResult.missing) {
+        debugLog('Backup skipped check (webdav): remote version missing, upload directly')
+      }
+      else if (remoteVersionResult.contentHash && remoteVersionResult.contentHash === contentHash) {
+        debugLog('Backup skipped (webdav): remote version unchanged')
+        const timestamp = new Date().toISOString()
+        await browser.storage.local.set({ [hashKey]: contentHash })
+        return await finalizeRandomBackupResult(provider, {
+          ok: true,
+          summary: '版本一致，已跳过上传',
+          timestamp,
+        }, isConcurrent)
+      }
 
       const ensureResult = await ensureWebDavDirectories(baseUrl, filePath, username, password)
       if (!ensureResult.ok) {
@@ -2304,15 +2340,12 @@ browser.alarms?.onAlarm.addListener(async (alarm) => {
 onMessage('random-backup-now', async () => {
   const stored = await browser.storage.local.get([
     'advanced-backup-enabled',
-    'advanced-backup-provider',
   ])
 
   const enabled = stored['advanced-backup-enabled'] === true
-  const backupProvider = stored['advanced-backup-provider'] as string | undefined
 
-  if (!enabled || !backupProvider) {
-    return { ok: false, error: '随机备份未启用或未配置备份方式' }
-  }
+  if (!enabled)
+    return { ok: false, error: '随机备份未启用' }
 
   return await performRandomBackup()
 })
